@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from langchain_core.documents import Document
 
 from backend import rag, server
+from backend.documents.pdf_loader import PDFDocument, PageText
 from backend.billing import INITIAL_TRIAL_CREDITS, billing_service
 from backend.mcp.server import mcp_server
 from backend.sdk.client import DocuChatClient, DocuChatError
@@ -49,15 +50,16 @@ def test_b2b_pricing_catalog(client):
 
 
 def test_b2b_list_models(client):
-    """Test retrieving available models (configured with Luna)."""
+    """Test retrieving available models from models.json."""
     resp = client.get("/api/v1/models")
     assert resp.status_code == 200
     data = resp.json()
     assert data["object"] == "list"
-    assert data["default_model"] == "gpt-6-luna"
-    assert len(data["data"]) == 1
-    assert data["data"][0]["id"] == "gpt-6-luna"
-    assert data["data"][0]["is_default"] is True
+    assert data["default_model"] in [m["id"] for m in data["data"]]
+    assert len(data["data"]) >= 11
+    ids = [m["id"] for m in data["data"]]
+    assert "gpt-6-luna" in ids
+    assert "gpt-4o-mini" in ids
 
 
 def test_b2b_account_unauthorized(client):
@@ -167,15 +169,18 @@ def test_b2b_search_chunks(client, b2b_account):
         assert "Liability" in data["results"][0]["content"]
 
 
-def test_b2b_pipeline_run_success_with_credits(client, b2b_account):
+def test_b2b_pipeline_run_success_with_credits(client, b2b_account, monkeypatch):
     """Test running a Document AI agent via pipeline endpoint with credit deduction."""
+    monkeypatch.setattr("backend.services.engine.query", lambda *args, **kwargs: {"id": "owned-document"})
     mock_bundle = MagicMock()
     mock_bundle.vector_store = MagicMock()
+    mock_bundle.doc_id = "owned-document"
+    mock_bundle.pdf_docs = [PDFDocument(name="invoice.pdf", pages=[PageText(1, "Vendor: Acme Inc\nTotal: 1250.00", "invoice.pdf", 1)])]
 
     mock_agent = MagicMock()
     mock_result = MagicMock()
     mock_result.success = True
-    mock_result.response = '{"vendor": "Acme Inc", "total": 1250.00, "status": "approved"}'
+    mock_result.response = '{"vendor": "Acme Inc", "total": 1250.00}'
     mock_agent.run.return_value = mock_result
 
     with patch("backend.rag.get_bundle", return_value=mock_bundle), patch(
@@ -203,10 +208,13 @@ def test_b2b_pipeline_run_success_with_credits(client, b2b_account):
         assert data["data"]["total"] == 1250.00
 
 
-def test_b2b_pipeline_run_failure_refunds_credits(client, b2b_account):
+def test_b2b_pipeline_run_failure_refunds_credits(client, b2b_account, monkeypatch):
     """Ensure failed pipeline executions automatically refund deducted credits."""
+    monkeypatch.setattr("backend.services.engine.query", lambda *args, **kwargs: {"id": "owned-document"})
     mock_bundle = MagicMock()
     mock_bundle.vector_store = MagicMock()
+    mock_bundle.doc_id = "owned-document"
+    mock_bundle.pdf_docs = [PDFDocument(name="invoice.pdf", pages=[PageText(1, "Vendor: Acme Inc\nTotal: 1250.00", "invoice.pdf", 1)])]
 
     mock_agent = MagicMock()
     mock_result = MagicMock()

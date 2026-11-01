@@ -3,7 +3,8 @@ import type { DocServiceItem } from "./docs-data";
 export function generateCurlCode(
   item: DocServiceItem,
   apiKey: string = "docu_live_sample_key_9912",
-  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17"
+  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17",
+  model?: string
 ): string {
   const base = "http://localhost:8000";
 
@@ -22,16 +23,22 @@ curl -X GET "${base}/api/v1/documents/${docId}/status" \\
   }
 
   if (item.id === "ocr") {
+    const ocrPayload = JSON.stringify(
+      {
+        document_id: docId,
+        start_page: 1,
+        end_page: 2,
+        language: "auto",
+        ...(model ? { model } : {}),
+      },
+      null,
+      2
+    );
     return `# Extract layout-aware bilingual OCR blocks
 curl -X POST "${base}/api/v1/ocr/advanced" \\
   -H "X-API-Key: ${apiKey}" \\
   -H "Content-Type: application/json" \\
-  -d '{
-    "document_id": "${docId}",
-    "start_page": 1,
-    "end_page": 2,
-    "language": "auto"
-  }'`;
+  -d '${ocrPayload}'`;
   }
 
   if (item.id === "pricing") {
@@ -56,6 +63,7 @@ curl -X GET "${base}/api/v1/company/account" \\
       service: item.serviceKey || item.id,
       document_id: docId,
       output_format: "json",
+      ...(model ? { model } : {}),
       ...(item.id === "chat" ? { query: "What is the total amount due and payment terms?" } : {}),
       ...(item.id === "translation" ? { query: "Translate document to Arabic" } : {}),
       ...(item.id === "factcheck" ? { query: "Verify if revenue grew by 28% in 2025." } : {}),
@@ -74,7 +82,8 @@ curl -X POST "${base}/api/v1/pipeline/run" \\
 export function generatePythonCode(
   item: DocServiceItem,
   apiKey: string = "docu_live_sample_key_9912",
-  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17"
+  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17",
+  model?: string
 ): string {
   const base = "http://localhost:8000";
 
@@ -109,8 +118,27 @@ response = httpx.get(
     f"{BASE_URL}/documents/{DOCUMENT_ID}/status",
     headers={"X-API-Key": API_KEY}
 )
-status_data = response.json()
-print(f"Active: {not status_data.get('isExpired')}, Remaining: {status_data.get('remainingSeconds')}s")`;
+res = response.json()
+print("TTL Status:", res.get("status"))
+print("Seconds Remaining:", res.get("remainingSeconds"))`;
+  }
+
+  if (item.id === "pricing") {
+    return `import httpx
+
+BASE_URL = "${base}/api/v1"
+
+response = httpx.get(f"{BASE_URL}/company/pricing")
+print("Pricing Catalog:", response.json())`;
+  }
+
+  if (item.id === "models") {
+    return `import httpx
+
+BASE_URL = "${base}/api/v1"
+
+response = httpx.get(f"{BASE_URL}/models")
+print("Available Models:", response.json())`;
   }
 
   if (item.type === "guide") {
@@ -136,7 +164,7 @@ DOCUMENT_ID = "${docId}"
 payload = {
     "service": "${sKey}",
     "document_id": DOCUMENT_ID,
-    "output_format": "json"
+    "output_format": "json"${model ? `,\n    "model": "${model}"` : ""}
 }
 
 # ⚡ Atomic execution: deducts ${item.credits} credits & resets 10-min sliding TTL
@@ -167,7 +195,8 @@ else:
 export function generateTypescriptCode(
   item: DocServiceItem,
   apiKey: string = "docu_live_sample_key_9912",
-  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17"
+  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17",
+  model?: string
 ): string {
   const base = "http://localhost:8000";
 
@@ -201,6 +230,7 @@ async function uploadDocument() {
   status: "success" | "error";
   service: string;
   documentId: string;
+  model?: string;
   creditsDeducted: number;
   creditsRemaining: number;
   ttlMinutes: number;
@@ -223,7 +253,7 @@ async function runService(): Promise<DocumentAIResponse> {
     body: JSON.stringify({
       service: "${sKey}",
       document_id: DOCUMENT_ID,
-      output_format: "json"
+      output_format: "json"${model ? `,\n      model: "${model}"` : ""}
     })
   });
 
@@ -234,14 +264,19 @@ async function runService(): Promise<DocumentAIResponse> {
   }
 
   const result: DocumentAIResponse = await res.json();
-  console.log(\`Processed via Luna! \${result.creditsRemaining} credits left.\`);
+  console.log(\`Processed via \${result.model || "AI"}! \${result.creditsRemaining} credits left.\`);
   return result;
-}`;
+}
+
+// Execute
+runService().then(console.log).catch(console.error);`;
 }
 
 export function generateWorkflowCode(
   item: DocServiceItem,
-  apiKey: string = "docu_live_sample_key_9912"
+  apiKey: string = "docu_live_sample_key_9912",
+  docId: string = "4b7d11dd-fc1d-4d5b-aec4-9b0c7239ea17",
+  model?: string
 ): string {
   const base = "http://localhost:8000";
   const sKey = item.serviceKey || item.id;
@@ -278,18 +313,17 @@ print(f"Step 1: Document uploaded. ID: {doc_id} (10-min sliding timer started)")
 res_a = client.post(f"{BASE_URL}/pipeline/run", json={
     "service": "${sKey}",
     "document_id": doc_id,
-    "output_format": "json"
+    "output_format": "json"${model ? `,\n    "model": "${model}"` : ""}
 }).json()
 print(f"Step 2: ${item.title} completed. Credits deducted: {res_a['creditsDeducted']}. Timer reset to 10m!")
 
 # STEP 3: Chain Another Service (Executive Summary) without re-uploading
 res_b = client.post(f"{BASE_URL}/pipeline/run", json={
     "service": "summary",
-    "document_id": doc_id
+    "document_id": doc_id${model ? `,\n    "model": "${model}"` : ""}
 }).json()
 print(f"Step 3: Executive Summary completed. Credits remaining: {res_b['creditsRemaining']}. Timer reset!")
 
 print("Step 4: All services chained cleanly. No permanent file left on disk.")
 `;
 }
-

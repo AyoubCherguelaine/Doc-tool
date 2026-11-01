@@ -11,6 +11,7 @@ Tests for bilingual REST endpoints on FastAPI server:
 
 from __future__ import annotations
 
+import json
 import uuid
 from unittest.mock import MagicMock
 
@@ -21,8 +22,14 @@ from backend import server
 from backend.agent.agents.base import AgentResult
 from backend.auth import get_current_user
 from backend.billing import billing_service
+from backend.documents.pdf_loader import PageText, PDFDocument
 
 USER = {"id": str(uuid.uuid4()), "name": "BilingualTester"}
+
+
+@pytest.fixture(autouse=True)
+def shared_document_query(monkeypatch):
+    monkeypatch.setattr("backend.services.engine.query", lambda *args, **kwargs: server.query(*args, **kwargs))
 
 
 @pytest.fixture
@@ -63,29 +70,53 @@ def test_bilingual_endpoints_success(client, monkeypatch, endpoint, service_name
     # Mock RAG bundle
     mock_bundle = MagicMock()
     mock_bundle.vector_store = MagicMock()
+    mock_bundle.doc_id = "doc-1"
+    text = {
+        "redaction": "Contact: test@example.test",
+        "classifier": "Tax Invoice",
+        "financial_statement": "Revenue: SAR 100\nNet income: SAR 0",
+        "translation": "Invoice 1: SAR 100",
+        "anomaly_audit": "Subtotal: SAR 100\nVAT 20%: SAR 20\nTotal: SAR 120",
+    }[service_name]
+    mock_bundle.pdf_docs = [PDFDocument(name="invoice_saudi.pdf", pages=[PageText(1, text, "invoice_saudi.pdf", 1)])]
     monkeypatch.setattr(server.rag, "get_bundle", lambda doc_id: mock_bundle)
 
     # Mock agent execution
     mock_agent = MagicMock()
     mock_agent.run.return_value = AgentResult(
-        response=f"Success response for {service_name}",
+        response=json.dumps(
+            {
+                "redaction": {"redacted_text": "Contact: [REDACTED_EMAIL]", "findings": []},
+                "classifier": {
+                    "document_type": "invoice",
+                    "language": "en",
+                    "department": "finance",
+                    "urgency": "normal",
+                },
+                "financial_statement": {"currency": "SAR", "metrics": {"revenue": 100, "net_income": 0}},
+                "translation": {"translated_text": "فاتورة ١: SAR ١٠٠", "terminology_notes": []},
+                "anomaly_audit": {"subtotal": 100, "tax_total": 20, "total": 120},
+            }[service_name],
+            ensure_ascii=False,
+        ),
         success=True,
         iterations=2,
         steps=[{"step": 1, "action": service_name}],
     )
-    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode: mock_agent)
+    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode, **kwargs: mock_agent)
 
     # Ensure company has credits
     account = billing_service.get_or_create_company(USER["id"], USER["name"])
     initial_credits = account.remaining_credits
-    cost = billing_service.get_service_cost(service_name)
+    cost = billing_service.get_service_cost(service_name, model="gpt-4o")
 
     res = client.post(endpoint, json={"model": "gpt-4o"})
     assert res.status_code == 200, res.text
     data = res.json()
     assert data["success"] is True
     assert data["service"] == service_name
-    assert f"Success response for {service_name}" in data["result"]
+    assert isinstance(data["data"], dict)
+    assert data["validation"]["schemaValidated"] is True
     assert data["creditsDeducted"] == cost
     assert data["creditsRemaining"] == initial_credits - cost
 
@@ -108,6 +139,15 @@ def test_bilingual_endpoints_refund_on_failure(client, monkeypatch, endpoint, se
     )
     mock_bundle = MagicMock()
     mock_bundle.vector_store = MagicMock()
+    mock_bundle.doc_id = "doc-1"
+    text = {
+        "redaction": "Contact: test@example.test",
+        "classifier": "Tax Invoice",
+        "financial_statement": "Revenue: SAR 100\nNet income: SAR 0",
+        "translation": "Invoice 1: SAR 100",
+        "anomaly_audit": "Subtotal: SAR 100\nVAT 20%: SAR 20\nTotal: SAR 120",
+    }[service_name]
+    mock_bundle.pdf_docs = [PDFDocument(name="invoice_saudi.pdf", pages=[PageText(1, text, "invoice_saudi.pdf", 1)])]
     monkeypatch.setattr(server.rag, "get_bundle", lambda doc_id: mock_bundle)
 
     # Simulate agent failure
@@ -118,7 +158,7 @@ def test_bilingual_endpoints_refund_on_failure(client, monkeypatch, endpoint, se
         error="Unreadable scan",
         iterations=1,
     )
-    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode: mock_agent)
+    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode, **kwargs: mock_agent)
 
     account = billing_service.get_or_create_company(USER["id"], USER["name"])
     balance_before = account.remaining_credits

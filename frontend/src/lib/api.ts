@@ -126,6 +126,7 @@ export interface AdvancedOcrResult {
   ocr_text: string;
   pages: { page_number: number; block_count: number; blocks: SemanticOcrBlock[] }[];
   blocks: SemanticOcrBlock[];
+  model?: string;
 }
 
 export interface AdvancedOcrParams {
@@ -134,6 +135,7 @@ export interface AdvancedOcrParams {
   start_page?: number;
   end_page?: number;
   language?: "auto" | "ar" | "en" | "mixed";
+  model?: string;
 }
 
 export async function extractAdvancedOcr(payload: AdvancedOcrParams | FormData) {
@@ -161,6 +163,9 @@ export async function extractAdvancedOcr(payload: AdvancedOcrParams | FormData) 
     }
     if (params.language) {
       formData.append("language", params.language);
+    }
+    if (params.model) {
+      formData.append("model", params.model);
     }
     return api<AdvancedOcrResult>("/v1/ocr/advanced", {
       method: "POST",
@@ -325,6 +330,14 @@ export interface DocumentAIServiceResponse {
   documentId: string;
   filename: string;
   service: string;
+  model?: string;
+  guardianEnabled?: boolean;
+  guardian?: {
+    enabled: boolean;
+    mode: string;
+    creditsCharged: number;
+    description: string;
+  };
   result: string;
   data?: any;
   creditsDeducted?: number;
@@ -400,7 +413,7 @@ export function auditAnomalies(documentId: string, options: { model?: string } =
 export function runDocumentService(
   documentId: string,
   serviceKey: string,
-  options: { model?: string } = {},
+  options: { model?: string; guardian?: boolean } = {},
 ) {
   const serviceEndpoints: Record<string, string> = {
     receipt: `/documents/${documentId}/receipt`,
@@ -421,7 +434,10 @@ export function runDocumentService(
   const endpoint = serviceEndpoints[serviceKey] || `/documents/${documentId}/workflow`;
   return api<DocumentAIServiceResponse>(endpoint, {
     method: "POST",
-    body: JSON.stringify({ model: options.model }),
+    body: JSON.stringify({
+      model: options.model,
+      guardian: options.guardian !== undefined ? options.guardian : true,
+    }),
   });
 }
 
@@ -483,6 +499,34 @@ export function fetchCompanyAccount() {
   return api<CompanyAccountInfo>("/company/account");
 }
 
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  userId: string;
+  userName?: string;
+  userEmail?: string;
+  planTier: string;
+  totalCredits: number;
+  usedCredits: number;
+  remainingCredits: number;
+  apiKeyPrefix: string;
+  apiKey: string;
+  rawApiKey?: string;
+  createdAt: string;
+  status: "active" | "suspended";
+}
+
+export function fetchWorkspace() {
+  return api<WorkspaceInfo>("/workspace");
+}
+
+export function updateWorkspace(name: string) {
+  return api<{ status: string; id: string; name: string; message: string }>("/workspace", {
+    method: "PUT",
+    body: JSON.stringify({ name }),
+  });
+}
+
 export function regenerateCompanyApiKey() {
   return api<{
     apiKey: string;
@@ -502,15 +546,35 @@ export function fetchCompanyUsage() {
   return api<CompanyUsageResponse>("/company/usage");
 }
 
+export interface ModelPricing {
+  input_per_million: number;
+  output_per_million: number;
+  cached_input_per_million?: number;
+}
+
+export interface ModelTokenCredits {
+  input_per_million: number;
+  output_per_million: number;
+  cached_input_per_million?: number;
+}
+
 export interface AvailableModelItem {
   id: string;
   name: string;
   description: string;
-  capabilities: string[];
+  provider?: string;
+  credit_cost: number;
+  cost_usd?: number;
+  cost_usd_formatted?: string;
+  pricing?: ModelPricing;
+  token_credits?: ModelTokenCredits;
+  speed_tier?: string;
+  reasoning_tier?: string;
   context_window?: number;
-  status: string;
+  status?: string;
   is_default: boolean;
-  pricing_tier?: string;
+  capabilities?: string[];
+  conversion_formula?: string;
 }
 
 export interface AvailableModelsResponse {
@@ -518,10 +582,82 @@ export interface AvailableModelsResponse {
   data: AvailableModelItem[];
   default_model: string;
   total_available: number;
+  credit_price_usd?: number;
+  conversion_formula?: string;
+  allowed_models?: string[];
+}
+
+export interface ServiceCostCalculationResponse {
+  model_id: string;
+  model_name: string;
+  base_service_credits: number;
+  model_credit_cost: number;
+  model_delta: number;
+  guardian?: boolean;
+  guardian_fee?: number;
+  guardian_discount?: number;
+  total_credits: number;
+  total_cost_usd: number;
+  total_cost_usd_formatted: string;
+  credit_price_usd: number;
+  conversion_formula: string;
+}
+
+export interface ModelSettingResponse {
+  currentModel?: string;
+  current_model?: string;
+  modelDetails?: AvailableModelItem;
+  model_details?: AvailableModelItem;
+  defaultModel?: string;
+  default_model?: string;
+  allowedModels?: string[];
+  allowed_models?: string[];
+  creditPriceUsd?: number;
+  conversionFormula?: string;
+}
+
+export interface GuardianSettingResponse {
+  guardian: boolean;
+  guardianFeeCredits: number;
+  mode: "guardian_verification" | "direct_return";
+  description: string;
 }
 
 export function fetchAvailableModels() {
-  return api<AvailableModelsResponse>("/v1/models");
+  return api<AvailableModelsResponse>("/models");
+}
+
+export function fetchModelSetting() {
+  return api<ModelSettingResponse>("/settings/model");
+}
+
+export function updateModelSetting(model: string) {
+  return api<ModelSettingResponse>("/settings/model", {
+    method: "POST",
+    body: JSON.stringify({ model }),
+  });
+}
+
+export function fetchGuardianSetting() {
+  return api<GuardianSettingResponse>("/settings/guardian");
+}
+
+export function updateGuardianSetting(enabled: boolean) {
+  return api<GuardianSettingResponse>("/settings/guardian", {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function calculateServiceCost(service: string, model?: string, guardian?: boolean) {
+  return api<ServiceCostCalculationResponse>("/services/calculate-cost", {
+    method: "POST",
+    body: JSON.stringify({
+      service,
+      model,
+      guardian: guardian !== undefined ? guardian : true,
+    }),
+  });
 }
 
 export interface PlaygroundPreset {
@@ -553,12 +689,20 @@ export interface PlaygroundRunPayload {
   model?: string;
   temperature?: number;
   output_format?: "json" | "markdown" | "auto";
+  guardian?: boolean;
 }
 
 export interface PlaygroundRunResult {
   success: boolean;
   service: string;
   model: string;
+  guardianEnabled?: boolean;
+  guardian?: {
+    enabled: boolean;
+    mode: string;
+    creditsCharged: number;
+    description: string;
+  };
   temperature?: number;
   documentId?: string;
   filename?: string;

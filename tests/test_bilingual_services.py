@@ -132,7 +132,7 @@ def test_bilingual_financial_statement_toolkit():
     إجمالي حقوق الملكية: 6,000,000 ريال
     """
     res = BilingualDocumentKit.analyze_financial_statement(statement_text)
-    assert "SAR" in res["currency"]
+    assert res["currency"] is None  # Bare "ريال" does not identify a country/currency.
     metrics = res["metrics"]
     assert metrics["revenue"] == 5000000.0
     assert metrics["gross_profit"] == 2000000.0
@@ -163,7 +163,7 @@ def test_translation_agent_initialization():
     mock_toolkit = MagicMock()
     agent = TranslationAgent(llm=mock_llm, tool_kit=mock_toolkit)
     assert agent is not None
-    assert "Certified Senior Legal" in agent.config.system_prompt
+    assert "Never claim that a translation is certified" in agent.config.system_prompt
 
 
 # ===========================================================================

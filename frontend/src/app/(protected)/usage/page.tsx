@@ -15,6 +15,7 @@ import {
   EyeOff,
   AlertCircle,
   Zap,
+  Coins,
 } from "lucide-react";
 import {
   CompanyAccountInfo,
@@ -27,8 +28,11 @@ import {
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { useModelSettings } from "@/components/providers/model-provider";
+import { ModelSelectorButton } from "@/components/ui/model-selector";
 
 export default function ApiUsagePage() {
+  const { availableModels, selectedModel, openModelModal } = useModelSettings();
   const [account, setAccount] = useState<CompanyAccountInfo | null>(null);
   const [pricing, setPricing] = useState<PricingCatalogResponse | null>(null);
   const [usage, setUsage] = useState<CompanyUsageResponse | null>(null);
@@ -107,8 +111,8 @@ export default function ApiUsagePage() {
     );
   }
 
-  const remaining = account?.remainingCredits ?? 1200;
-  const total = account?.totalCredits ?? 1200;
+  const remaining = account?.remainingCredits ?? 300;
+  const total = account?.totalCredits ?? 300;
   const used = account?.usedCredits ?? 0;
   const percentRemaining = Math.max(0, Math.min(100, Math.round((remaining / total) * 100)));
 
@@ -159,7 +163,7 @@ export default function ApiUsagePage() {
               </span>
             </div>
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              Every company receives <strong>1,200 starting credits</strong> to run all enterprise Document AI services.
+              Every company receives <strong>300 starting credits</strong> to run all enterprise Document AI services.
             </p>
 
             {/* Visual Progress Bar */}
@@ -184,7 +188,7 @@ export default function ApiUsagePage() {
             </div>
             <div className="flex items-center justify-between text-xs">
               <span className="text-slate-500 dark:text-slate-400">Trial Credits Included</span>
-              <span className="font-semibold text-emerald-600 dark:text-emerald-400">1,200 Credits</span>
+              <span className="font-semibold text-emerald-600 dark:text-emerald-400">300 Credits</span>
             </div>
             <div className="flex items-center justify-between text-xs">
               <span className="text-slate-500 dark:text-slate-400">Active API Keys</span>
@@ -278,7 +282,7 @@ export default function ApiUsagePage() {
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700">
               {pricing?.services.map((item) => {
-                const callsWith1200 = Math.floor(1200 / item.credits);
+                const callsCapacity = Math.floor((account?.totalCredits ?? 300) / item.credits);
                 return (
                   <tr key={item.id} className="hover:bg-slate-50/50 transition">
                     <td className="px-4 py-3 font-medium text-slate-900">
@@ -295,7 +299,92 @@ export default function ApiUsagePage() {
                       {item.credits} credits
                     </td>
                     <td className="px-4 py-3 text-right text-slate-500">
-                      ~{callsWith1200} calls
+                      ~{callsCapacity} calls
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Superset & OpenAI Model Economics Catalog (from models.json) */}
+      <div className="mb-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
+              <Coins size={14} className="text-emerald-600" /> LLM Model Economics &amp; Pricing (models.json)
+            </div>
+            <h2 className="mt-1 text-lg font-semibold text-slate-900">
+              Model Inference Rates ($2.00 USD = 1,000 Credits)
+            </h2>
+            <p className="text-xs text-slate-500">
+              Every Document AI request strictly uses models from models.json. 1 credit = $0.002 USD (500 cr / $1.00).
+            </p>
+          </div>
+          <ModelSelectorButton size="sm" />
+        </div>
+
+        <div className="overflow-x-auto rounded-xl border border-slate-100">
+          <table className="w-full text-left text-xs">
+            <thead className="border-b border-slate-200 bg-slate-50 text-slate-600 uppercase tracking-wider font-semibold text-[10px]">
+              <tr>
+                <th className="px-4 py-3">Model Name &amp; ID</th>
+                <th className="px-4 py-3">Speed &amp; Reasoning Tier</th>
+                <th className="px-4 py-3 text-right">Credit Fee / Run</th>
+                <th className="px-4 py-3 text-right">USD Equivalent</th>
+                <th className="px-4 py-3 text-right">Input ($ / 1M)</th>
+                <th className="px-4 py-3 text-right">Output ($ / 1M)</th>
+                <th className="px-4 py-3 text-center">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 text-slate-700 font-mono text-[11px]">
+              {availableModels.map((m) => {
+                const isSelected = selectedModel === m.id;
+                const costUsd = (m.credit_cost * 0.002).toFixed(3);
+                return (
+                  <tr
+                    key={m.id}
+                    className={`transition ${
+                      isSelected ? "bg-emerald-50/50 font-bold" : "hover:bg-slate-50/50"
+                    }`}
+                  >
+                    <td className="px-4 py-3 font-medium text-slate-900">
+                      <div>{m.name}</div>
+                      <div className="text-[10px] text-slate-400 font-normal">{m.id}</div>
+                    </td>
+                    <td className="px-4 py-3 font-sans">
+                      <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-700">
+                        {m.speed_tier} • {m.reasoning_tier}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right font-bold text-emerald-700">
+                      {m.credit_cost} cr
+                    </td>
+                    <td className="px-4 py-3 text-right text-slate-800">
+                      ${costUsd}
+                    </td>
+                    <td className="px-4 py-3 text-right text-slate-500">
+                      ${m.pricing?.input_per_million}/M
+                    </td>
+                    <td className="px-4 py-3 text-right text-slate-500">
+                      ${m.pricing?.output_per_million}/M
+                    </td>
+                    <td className="px-4 py-3 text-center font-sans">
+                      {isSelected ? (
+                        <span className="inline-flex items-center gap-1 rounded bg-emerald-600 px-2 py-0.5 text-[10px] font-semibold text-white">
+                          Active
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => openModelModal()}
+                          className="text-[10px] text-slate-500 hover:text-emerald-700 hover:underline"
+                        >
+                          Select
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );
@@ -448,7 +537,7 @@ extractDocumentData().catch(console.error);`}
               <span>/api/v1/models</span>
             </div>
             <p className="text-xs text-slate-600">
-              List available AI models for document intelligence. Returns active model: <code className="text-teal-700 font-semibold">gpt-6-luna</code> (Luna).
+              List available AI models strictly loaded from <code className="text-emerald-700 font-semibold font-mono">models.json</code> with token pricing and credit conversion ($2.00 USD = 1,000 Credits).
             </p>
           </div>
 
@@ -458,7 +547,7 @@ extractDocumentData().catch(console.error);`}
               <span>/api/v1/company/pricing</span>
             </div>
             <p className="text-xs text-slate-600">
-              Retrieve full pricing catalog across all 19 Document AI services, LLM compute tiers, and free trial allocations (1,200 credits).
+              Retrieve full pricing catalog across all 19 Document AI services, LLM compute tiers, and free trial allocations (300 credits).
             </p>
           </div>
         </div>

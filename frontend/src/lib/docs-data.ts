@@ -60,7 +60,7 @@ export const DOCS_CATEGORIES: DocCategory[] = [
           "DOC Tool is an enterprise-grade, stateless Document Intelligence platform powered by Luna (gpt-6-luna). It provides 19+ specialized AI pipelines for financial documents, legal contracts, forms, and resumes, alongside advanced bilingual (Arabic & English) layout OCR.",
         capabilities: [
           "Stateless ephemeral document ingestion with 10-minute sliding inactivity TTL",
-          "Atomic credit deduction with 1,200 free trial credits for every company",
+          "Atomic credit deduction with 300 free trial credits for every company",
           "Dedicated Luna (gpt-6-luna) vision model with 128k context window",
           "Zero permanent storage: files and embeddings are wiped after 10 min of inactivity",
           "Deterministic JSON schema adherence and tabular Markdown extraction",
@@ -72,7 +72,7 @@ export const DOCS_CATEGORIES: DocCategory[] = [
           version: "v1.0.0",
           model: "gpt-6-luna",
           ttl_minutes: 10,
-          trial_credits: 1200,
+          trial_credits: 300,
           status: "operational",
         },
         notes: [
@@ -209,7 +209,7 @@ export const DOCS_CATEGORIES: DocCategory[] = [
           ttlMinutes: 10,
           remainingSeconds: 600,
           expiresAt: "2026-10-27T16:30:00Z",
-          creditsRemaining: 1200,
+          creditsRemaining: 300,
           message: "Document session active. Retained for 10 minutes without usage.",
         },
       },
@@ -1692,7 +1692,7 @@ export const DOCS_CATEGORIES: DocCategory[] = [
         llmTier: "Catalog",
         badge: "Pricing API",
         description:
-          "Returns the live pricing catalog of all 19 Document AI services, initial free trial credits (1,200), and compute tier levels.",
+          "Returns the live pricing catalog of all 19 Document AI services, initial free trial credits (300), and compute tier levels.",
         capabilities: [
           "Public endpoint: returns live pricing for programmatic billing calculations",
           "Includes per-call credit cost for all 19 services",
@@ -1701,7 +1701,7 @@ export const DOCS_CATEGORIES: DocCategory[] = [
         bilingual: false,
         parameters: [],
         sampleResponse: {
-          initialTrialCredits: 1200,
+          initialTrialCredits: 300,
           services: [
             { id: "chat", name: "Document Chat", credits: 1, category: "General" },
             { id: "summary", name: "Executive Summary", credits: 10, category: "General" },

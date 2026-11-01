@@ -7,11 +7,14 @@ import {
   ScanText,
   Grid2X2,
   BookOpen,
+  Building,
 } from "lucide-react";
 import { useLanguage } from "@/components/providers/language-provider";
+import { useSession } from "@/components/providers/session-provider";
 
 export default function OverviewPage() {
   const { t } = useLanguage();
+  const { user } = useSession();
   const tools = [
     {
       href: "/conversations",
@@ -47,7 +50,18 @@ export default function OverviewPage() {
   return (
     <div className="mx-auto max-w-6xl space-y-9 animate-enter">
       <header className="max-w-2xl">
-        <p className="eyebrow mb-2">{t("Your workspace", "مساحة عملك")}</p>
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <p className="eyebrow">{t("Your workspace", "مساحة عملك")}</p>
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200/80 bg-emerald-50 px-2.5 py-0.5 text-xs font-mono font-semibold text-emerald-800 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-300">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            <Building size={11} className="text-emerald-600 dark:text-emerald-400" />
+            <span>
+              {user?.name && !user.name.startsWith("http") && !user.name.includes("@")
+                ? `${user.name.trim()}'s Workspace`
+                : "Ayoub's Workspace"}
+            </span>
+          </span>
+        </div>
         <h1 className="text-3xl font-bold tracking-tight">
           {t("What do you need to do?", "ما الذي تريد إنجازه؟")}
         </h1>

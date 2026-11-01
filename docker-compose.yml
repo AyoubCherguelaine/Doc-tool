@@ -80,6 +80,7 @@ services:
     volumes:
       - uploads_data:/app/backend/uploads
       - indexes_data:/app/backend/faiss_indexes
+      - ./models.json:/app/models.json:ro
     depends_on:
       db:
         condition: service_healthy
@@ -121,6 +122,7 @@ services:
     volumes:
       - uploads_data:/app/backend/uploads
       - indexes_data:/app/backend/faiss_indexes
+      - ./models.json:/app/models.json:ro
     depends_on:
       db:
         condition: service_healthy
@@ -142,6 +144,7 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
       NEXT_PUBLIC_APP_NAME: DOCTool
       NEXTAUTH_URL: http://localhost:3000
+      BACKEND_URL: ${BACKEND_URL:-http://backend:8000}
     depends_on:
       backend:
         condition: service_healthy

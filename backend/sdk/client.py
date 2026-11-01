@@ -60,6 +60,7 @@ class DOCToolClient:
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{endpoint}"
         try:
@@ -67,7 +68,7 @@ class DOCToolClient:
                 resp = client.request(
                     method=method,
                     url=url,
-                    headers=self.headers,
+                    headers={**self.headers, **({"Idempotency-Key": idempotency_key} if idempotency_key else {})},
                     params=params,
                     json=json_data,
                     files=files,
@@ -83,7 +84,7 @@ class DOCToolClient:
                         status_code=resp.status_code,
                         details=detail,
                     )
-                return resp.json()
+                return resp.json() if resp.status_code != 204 else {}
         except httpx.RequestError as exc:
             raise DOCToolError(f"Network transport error connecting to {url}: {exc}") from exc
 
@@ -140,7 +141,12 @@ class DOCToolClient:
         query: Optional[str] = None,
         output_format: Literal["json", "markdown", "auto"] = "auto",
         model: Optional[str] = None,
+        guardian: bool = True,
         webhook_url: Optional[str] = None,
+        options: Optional[Dict[str, Any]] = None,
+        schema_override: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        text_content: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute an AI service on a document in the pipeline.
@@ -154,9 +160,13 @@ class DOCToolClient:
             "query": query,
             "output_format": output_format,
             "model": model,
+            "guardian": guardian,
             "webhook_url": webhook_url,
+            "options": options or {},
+            "schema_override": schema_override,
+            "text_content": text_content,
         }
-        return self._request("POST", "/api/v1/pipeline/run", json_data=payload)
+        return self._request("POST", "/api/v1/pipeline/run", json_data=payload, idempotency_key=idempotency_key)
 
     def extract_invoice(self, document_id: str, query: Optional[str] = None) -> Dict[str, Any]:
         """Extract structured line items, vendor details, and totals from an invoice."""
@@ -190,19 +200,105 @@ class DOCToolClient:
         """Analyze balance sheets and P&L statements, extracting financial ratios."""
         return self.run_pipeline(document_id, service="financial_statement", query=query, output_format="json")
 
-    def translate_document(self, document_id: str, target_language: str = "Arabic") -> Dict[str, Any]:
-        """Translate document preserving legal and financial terminology."""
-        prompt = f"Translate document into {target_language} preserving clauses and formatting."
-        return self.run_pipeline(document_id, service="translation", query=prompt, output_format="markdown")
+    def translate_document(
+        self,
+        document_id: str,
+        target_language: str = "Arabic",
+        *,
+        source_language: str = "auto",
+        glossary: Optional[Dict[str, str]] = None,
+        preserve_names: Optional[List[str]] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Translate with explicit language, terminology and preservation checks."""
+        languages = {"arabic": "ar", "english": "en", "ar": "ar", "en": "en", "auto": "auto"}
+        target = languages.get(target_language.lower())
+        source = languages.get(source_language.lower())
+        if target not in {"ar", "en"} or source is None:
+            raise ValueError("Supported languages are Arabic/ar and English/en; source may be auto")
+        return self.run_pipeline(
+            document_id,
+            "translation",
+            output_format="json",
+            idempotency_key=idempotency_key,
+            options={
+                "translation": {
+                    "target_language": target,
+                    "source_language": source,
+                    "glossary": glossary or {},
+                    "preserve_names": preserve_names or [],
+                }
+            },
+        )
+
+    def match_invoice(
+        self,
+        invoice_document_id: str,
+        purchase_order_document_id: str,
+        *,
+        financial_options: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self.run_pipeline(
+            invoice_document_id,
+            "invoice_matching",
+            output_format="json",
+            idempotency_key=idempotency_key,
+            options={"reference_document_id": purchase_order_document_id, "financial": financial_options or {}},
+        )
+
+    def compare_contract_versions(
+        self, before_document_id: str, after_document_id: str, *, idempotency_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return self.run_pipeline(
+            before_document_id,
+            "contract_comparison",
+            output_format="json",
+            idempotency_key=idempotency_key,
+            options={"reference_document_id": after_document_id},
+        )
+
+    def check_document(
+        self,
+        document_id: str,
+        *,
+        rules: Optional[List[Dict[str, Any]]] = None,
+        rule_set_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self.run_pipeline(
+            document_id,
+            "document_checks",
+            output_format="json",
+            idempotency_key=idempotency_key,
+            options={"rules": rules or [], "rule_set_id": rule_set_id},
+        )
+
+    def create_rule_set(self, name: str, rules: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/rule-sets", json_data={"name": name, "rules": rules})
+
+    def list_rule_sets(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/rule-sets")
+
+    def get_rule_set(self, rule_set_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/api/v1/rule-sets/{rule_set_id}")
+
+    def update_rule_set(self, rule_set_id: str, name: str, rules: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return self._request("PUT", f"/api/v1/rule-sets/{rule_set_id}", json_data={"name": name, "rules": rules})
+
+    def delete_rule_set(self, rule_set_id: str) -> None:
+        self._request("DELETE", f"/api/v1/rule-sets/{rule_set_id}")
 
     def audit_anomalies(self, document_id: str, query: Optional[str] = None) -> Dict[str, Any]:
         """Perform forensic arithmetic, tax, and date consistency audit."""
         return self.run_pipeline(document_id, service="anomaly_audit", query=query, output_format="json")
 
-    def batch_run(self, tasks: List[Dict[str, Any]], webhook_url: Optional[str] = None) -> Dict[str, Any]:
+    def batch_run(
+        self, tasks: List[Dict[str, Any]], webhook_url: Optional[str] = None, idempotency_key: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Run batch processing across multiple documents and services."""
         payload = {"tasks": tasks, "webhook_url": webhook_url}
-        return self._request("POST", "/api/v1/pipeline/batch", json_data=payload)
+        return self._request("POST", "/api/v1/pipeline/batch", json_data=payload, idempotency_key=idempotency_key)
 
     def submit_async_job(
         self,
@@ -211,6 +307,10 @@ class DOCToolClient:
         query: Optional[str] = None,
         output_format: Literal["json", "markdown", "auto"] = "auto",
         webhook_url: Optional[str] = None,
+        options: Optional[Dict[str, Any]] = None,
+        schema_override: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Submit a background asynchronous job (Redis queue) and return job ID immediately."""
         payload = {
@@ -219,8 +319,11 @@ class DOCToolClient:
             "query": query,
             "output_format": output_format,
             "webhook_url": webhook_url,
+            "options": options or {},
+            "schema_override": schema_override,
+            "model": model,
         }
-        return self._request("POST", "/api/v1/pipeline/jobs", json_data=payload)
+        return self._request("POST", "/api/v1/pipeline/jobs", json_data=payload, idempotency_key=idempotency_key)
 
     def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Poll the status, progress (0-100), and result of a background job."""
@@ -247,7 +350,14 @@ class DOCToolClient:
         """Get service catalog and credit pricing."""
         return self._request("GET", "/api/v1/company/pricing")
 
+    def get_guardian_setting(self) -> Dict[str, Any]:
+        """Get the current Guardian mode setting."""
+        return self._request("GET", "/api/v1/settings/guardian")
+
+    def set_guardian_setting(self, enabled: bool) -> Dict[str, Any]:
+        """Update Guardian mode setting."""
+        return self._request("POST", "/api/v1/settings/guardian", json_data={"enabled": enabled})
+
 
 # Backwards compatibility alias
 DocuChatClient = DOCToolClient
-

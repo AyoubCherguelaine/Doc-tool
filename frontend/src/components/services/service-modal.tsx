@@ -1,7 +1,7 @@
 "use client";
 import { getUploadSizeError, UPLOAD_LIMIT_LABEL } from "@/lib/upload-limits";
 
-import { useState, useRef, useMemo } from "react";
+import { useState, useRef, useMemo, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import {
   X,
@@ -23,6 +23,8 @@ import {
   FileJson,
   Table2,
   Code2,
+  ShieldCheck,
+  ShieldAlert,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -35,6 +37,8 @@ import {
 } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 import type { Document } from "@/lib/types";
+import { useModelSettings } from "@/components/providers/model-provider";
+import { getModelIcon } from "@/components/ui/model-selector";
 
 export interface ServiceCardInfo {
   id: string;
@@ -68,6 +72,17 @@ export function ServiceLauncherModal({
   remainingCredits,
 }: ServiceLauncherModalProps) {
   const router = useRouter();
+  const { availableModels, selectedModel, guardianMode, calculateCost } = useModelSettings();
+  const [modalModel, setModalModel] = useState<string>(selectedModel);
+  const [modalGuardian, setModalGuardian] = useState<boolean>(guardianMode);
+
+  useEffect(() => {
+    setModalModel(selectedModel);
+  }, [selectedModel]);
+
+  useEffect(() => {
+    setModalGuardian(guardianMode);
+  }, [guardianMode]);
 
   // Tab: 'upload'
   const [sourceTab, setSourceTab] = useState<"drive" | "upload">("upload");
@@ -185,7 +200,10 @@ export function ServiceLauncherModal({
     setRunError("");
     setRunResult(null);
     try {
-      const res = await runDocumentService(activeDoc.id, service.id);
+      const res = await runDocumentService(activeDoc.id, service.id, {
+        model: modalModel || selectedModel,
+        guardian: modalGuardian,
+      });
       setRunResult(res);
     } catch (err) {
       setRunError(
@@ -305,6 +323,40 @@ export function ServiceLauncherModal({
                     {copied ? <Check size={13} /> : <Copy size={13} />}
                     {copied ? "Copied" : "Copy output"}
                   </button>
+                </div>
+              </div>
+
+              {/* Superset Execution Telemetry Strip */}
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-2.5 dark:border-slate-800 dark:bg-slate-900 text-center font-mono text-xs">
+                <div>
+                  <span className="block text-[10px] text-slate-400 font-sans uppercase">Model Used</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200 truncate block">
+                    {runResult.model || modalModel}
+                  </span>
+                </div>
+                <div>
+                  <span className="block text-[10px] text-slate-400 font-sans uppercase">Guardian Mode</span>
+                  <span className={`font-bold truncate block ${runResult.guardianEnabled !== false ? "text-emerald-600 dark:text-emerald-400" : "text-amber-500"}`}>
+                    {runResult.guardianEnabled !== false ? "Verified (+5cr)" : "Direct (Waived)"}
+                  </span>
+                </div>
+                <div>
+                  <span className="block text-[10px] text-slate-400 font-sans uppercase">Deducted</span>
+                  <span className="font-bold text-amber-600 dark:text-amber-400">
+                    {runResult.creditsDeducted ?? 0} cr
+                  </span>
+                </div>
+                <div>
+                  <span className="block text-[10px] text-slate-400 font-sans uppercase">USD Value</span>
+                  <span className="font-bold text-emerald-600 dark:text-emerald-400">
+                    ${((runResult.creditsDeducted ?? 0) * 0.002).toFixed(3)}
+                  </span>
+                </div>
+                <div>
+                  <span className="block text-[10px] text-slate-400 font-sans uppercase">Balance</span>
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">
+                    {runResult.creditsRemaining ?? 0} cr
+                  </span>
                 </div>
               </div>
 
@@ -631,6 +683,104 @@ export function ServiceLauncherModal({
                   <span className="text-[10px] text-slate-500">
                     {formatBytes(activeDoc.fileSize)}
                   </span>
+                </div>
+              )}
+
+              {/* OpenAI & Superset Model Selector and Cost Breakdown */}
+              {service && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5 dark:border-slate-800 dark:bg-slate-900/60 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                      <Sparkles size={13} className="text-emerald-500" />
+                      <span>Processing Model (models.json)</span>
+                    </label>
+                    <select
+                      value={modalModel}
+                      onChange={(e) => setModalModel(e.target.value)}
+                      disabled={running}
+                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-mono font-medium text-slate-800 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                    >
+                      {availableModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} ({m.credit_cost} cr • ${(m.credit_cost * 0.002).toFixed(3)})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Guardian Verification Toggle */}
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-white dark:bg-slate-800/80 border border-slate-200/50 dark:border-slate-700/50">
+                    <div className="flex items-center gap-2">
+                      {modalGuardian ? (
+                        <ShieldCheck size={16} className="text-emerald-500 shrink-0" />
+                      ) : (
+                        <ShieldAlert size={16} className="text-amber-500 shrink-0" />
+                      )}
+                      <div>
+                        <div className="text-xs font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                          <span>Guardian Verification</span>
+                          <span
+                            className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                              modalGuardian
+                                ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300"
+                                : "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                            }`}
+                          >
+                            {modalGuardian ? "+5 cr Guardian Fee" : "Fee Waived (Direct Return)"}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {modalGuardian
+                            ? "Strict evidence citation check, schema validation & guardrails."
+                            : "Raw model values returned directly without evidence citation nullification."}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setModalGuardian(!modalGuardian)}
+                      disabled={running}
+                      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                        modalGuardian ? "bg-emerald-600" : "bg-slate-300 dark:bg-slate-600"
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                          modalGuardian ? "translate-x-4" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {(() => {
+                    const pricing = calculateCost(service.credits, modalModel, modalGuardian);
+                    return (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-200/60 dark:border-slate-800 text-center">
+                        <div className="rounded-lg bg-white p-2 dark:bg-slate-800/80 border border-slate-200/50 dark:border-slate-700/50">
+                          <span className="block text-[10px] text-slate-400 font-medium uppercase">Base Service</span>
+                          <span className="font-mono text-xs font-bold text-slate-700 dark:text-slate-300">{service.credits} cr</span>
+                        </div>
+                        <div className="rounded-lg bg-white p-2 dark:bg-slate-800/80 border border-slate-200/50 dark:border-slate-700/50">
+                          <span className="block text-[10px] text-slate-400 font-medium uppercase">Model Rate</span>
+                          <span className="font-mono text-xs font-bold text-slate-700 dark:text-slate-300">
+                            {pricing.modelCost} cr ({pricing.modelDelta >= 0 ? `+${pricing.modelDelta}` : pricing.modelDelta})
+                          </span>
+                        </div>
+                        <div className="rounded-lg bg-white p-2 dark:bg-slate-800/80 border border-slate-200/50 dark:border-slate-700/50">
+                          <span className="block text-[10px] text-slate-400 font-medium uppercase">Guardian</span>
+                          <span className={`font-mono text-xs font-bold ${modalGuardian ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}`}>
+                            {modalGuardian ? "+5 cr" : `-${pricing.guardianDiscount} cr`}
+                          </span>
+                        </div>
+                        <div className="rounded-lg bg-emerald-50 dark:bg-emerald-950/40 p-2 border border-emerald-200 dark:border-emerald-800">
+                          <span className="block text-[10px] text-emerald-700 dark:text-emerald-300 font-medium uppercase">Total Charge</span>
+                          <span className="font-mono text-xs font-black text-emerald-800 dark:text-emerald-200">
+                            {pricing.totalCredits} cr <span className="text-[10px] font-normal">({pricing.costUsdFormatted})</span>
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 

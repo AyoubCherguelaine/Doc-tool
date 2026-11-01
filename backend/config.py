@@ -21,10 +21,16 @@ class Settings:
 
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
-    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-6-luna")
-    CHAT_MODELS: list[str] = list(dict.fromkeys([DEFAULT_MODEL] + [
-        m.strip() for m in os.getenv("CHAT_MODELS", "").split(",") if m.strip()
-    ]))
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
+    _env_chat_models = [m.strip() for m in os.getenv("CHAT_MODELS", "").split(",") if m.strip()]
+    try:
+        import json
+        with open(REPO_ROOT / "models.json", "r", encoding="utf-8") as _mf:
+            _mdata = json.load(_mf)
+            _json_models = [m["id"] for m in _mdata.get("models", []) if "id" in m]
+    except Exception:
+        _json_models = []
+    CHAT_MODELS: list[str] = list(dict.fromkeys([DEFAULT_MODEL] + _json_models + _env_chat_models))
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "backend/uploads")

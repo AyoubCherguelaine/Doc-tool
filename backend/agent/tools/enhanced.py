@@ -456,7 +456,7 @@ class EnhancedDocumentKit:
         registry.register(
             Tool(
                 name="explain_document_services",
-                description="List and explain all 19 DOC Tool Document AI services with capabilities and credit costs.",
+                description="List document services with their capabilities and current credit costs.",
                 parameters={"type": "object", "properties": {}, "required": []},
                 func=self.explain_services,
             )
@@ -539,32 +539,13 @@ class EnhancedDocumentKit:
         return "\n\n".join(f"{h}\n\n{t}" for h, t in zip(parts, texts))
 
     def explain_services(self) -> str:
-        """Return catalog of all 19 Document AI services with credit pricing and capabilities."""
+        """Use the billing catalog so service names and prices cannot drift."""
         from backend.billing import SERVICE_PRICING
-        lines = [
-            "### DOC Tool Document AI Service Catalog & Pricing\n",
-            "| Service | Cost | Description |",
-            "| :--- | :--- | :--- |",
-            "| **chat** | 1 credit | Interactive conversational document reasoning |",
-            "| **summary** | 10 credits | Multi-section executive summary with takeaways |",
-            "| **extraction** | 15 credits | Structured table, schema, and metrics extraction |",
-            "| **classifier** | 15 credits | Document taxonomy and category classification |",
-            "| **semantic_search** | 15 credits | Cross-lingual semantic search across English/Arabic |",
-            "| **factcheck** | 15 credits | Factual claim verification against document context |",
-            "| **receipt** | 20 credits | Receipt line items, merchant, tax, and expenses |",
-            "| **comparison** | 20 credits | Comparative analysis across clauses or documents |",
-            "| **invoice** | 25 credits | Vendor, line items, VAT, and payment terms extraction |",
-            "| **resume** | 25 credits | Candidate skills taxonomy, timeline, and seniority |",
-            "| **redaction** | 25 credits | PII masking (National IDs, IBANs, VAT, phones) |",
-            "| **form_parser** | 25 credits | Key-value pairs, checkboxes, and signatures |",
-            "| **compliance** | 30 credits | PII audit, GDPR/HIPAA risk scoring, privacy checks |",
-            "| **contract** | 35 credits | Legal clauses, liabilities, risk analysis |",
-            "| **financial_statement** | 35 credits | Balance sheet, P&L, income, solvency ratios |",
-            "| **translation** | 35 credits | High-fidelity bilingual Arabic-English translation |",
-            "| **arabic_ocr** | 35 credits | Specialized Arabic diacritics and dialect OCR |",
-            "| **anomaly_audit** | 35 credits | Numeric irregularity and fraud risk detection |",
-            "| **coordinator** | 45 credits | Multi-agent orchestrator for complex workflows |",
-        ]
+
+        lines = ["### Document services", "| Service | Credits | Description |", "| :--- | :--- | :--- |"]
+        for service, details in SERVICE_PRICING.items():
+            lines.append(f"| **{service}** | {details['credits']} | {details['description']} |")
+        lines.append("Invoice matching and contract version comparison require a second document. Document checks accept company rules.")
         return "\n".join(lines)
 
     def run_service_tool(self, service: str, instruction: str = "") -> str:
@@ -1099,6 +1080,7 @@ class EnhancedDocumentKit:
 
         try:
             import json
+
             from backend.agent.tools.ocr import OcrService
 
             service = OcrService(llm=self.llm)
@@ -1129,6 +1111,7 @@ class EnhancedDocumentKit:
 
         try:
             import json
+
             from backend.agent.tools.ocr import OcrService
 
             service = OcrService(llm=self.llm)

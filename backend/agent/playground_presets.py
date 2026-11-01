@@ -35,33 +35,33 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                 "name": "CloudScale Solutions LLC",
                 "tax_id": "US-987654321",
                 "email": "billing@cloudscale.io",
-                "address": "100 Tech Boulevard, Suite 400, San Francisco, CA 94107"
+                "address": "100 Tech Boulevard, Suite 400, San Francisco, CA 94107",
             },
             "client": {
                 "name": "Acme Global Enterprise",
                 "tax_id": "US-123456789",
                 "email": "procurement@acme.com",
-                "address": "500 Market St, Denver, CO 80202"
+                "address": "500 Market St, Denver, CO 80202",
             },
             "line_items": [
                 {
                     "description": "Enterprise Cloud Hosting - Tier 3",
                     "quantity": 1,
                     "unit_price": 2500.0,
-                    "amount": 2500.0
+                    "amount": 2500.0,
                 },
                 {
                     "description": "AI Agent Runtime Add-on (100k queries)",
                     "quantity": 2,
                     "unit_price": 450.0,
-                    "amount": 900.0
-                }
+                    "amount": 900.0,
+                },
             ],
             "subtotal": 3400.0,
             "tax_rate": 0.1,
             "tax_amount": 340.0,
             "total_amount": 3740.0,
-            "payment_terms": "Net 15 via Wire Transfer to IBAN US89CSCL1234567890"
+            "payment_terms": "Net 15 via Wire Transfer to IBAN US89CSCL1234567890",
         },
         "sample_text": (
             "INVOICE\n"
@@ -109,20 +109,20 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "merchant": {
                 "name": "Blue Bottle Coffee",
                 "address": "66 Mint Plaza, San Francisco, CA",
-                "phone": "+1 415-555-2345"
+                "phone": "+1 415-555-2345",
             },
             "date": "2026-10-22",
             "time": "08:42 AM",
             "items": [
                 {"name": "Hayes Valley Espresso", "quantity": 1, "price": 4.5},
-                {"name": "Almond Croissant", "quantity": 1, "price": 5.25}
+                {"name": "Almond Croissant", "quantity": 1, "price": 5.25},
             ],
             "subtotal": 9.75,
             "tax": 0.83,
             "tip": 2.0,
             "total": 12.58,
             "payment_method": "Visa ending in 4242",
-            "expense_category": "Meals & Entertainment"
+            "expense_category": "Meals & Entertainment",
         },
         "sample_text": (
             "BLUE BOTTLE COFFEE\n"
@@ -161,7 +161,7 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "title": "Master Software As A Service Agreement",
             "parties": [
                 {"name": "DataVault Inc.", "role": "Provider", "jurisdiction": "Delaware"},
-                {"name": "Horizon Retailers Ltd.", "role": "Customer", "jurisdiction": "California"}
+                {"name": "Horizon Retailers Ltd.", "role": "Customer", "jurisdiction": "California"},
             ],
             "effective_date": "2026-11-01",
             "term_months": 24,
@@ -172,16 +172,16 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "key_clauses": {
                 "confidentiality_duration": "5 years following termination",
                 "data_protection": "GDPR and CCPA compliant with 48h breach notification",
-                "termination_for_convenience": "90 days written notice"
+                "termination_for_convenience": "90 days written notice",
             },
             "risk_flags": [
                 {
                     "severity": "medium",
                     "clause": "Automatic 24-month renewal",
-                    "recommendation": "Negotiate 12-month auto-renewal with 30-day notice window."
+                    "recommendation": "Negotiate 12-month auto-renewal with 30-day notice window.",
                 }
             ],
-            "overall_risk_score_1_to_10": 3.5
+            "overall_risk_score_1_to_10": 3.5,
         },
         "sample_text": (
             "MASTER SOFTWARE AS A SERVICE AGREEMENT\n\n"
@@ -224,13 +224,13 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "detected_pii": [
                 {"type": "SSN", "value_masked": "***-**-6789", "risk": "CRITICAL", "count": 2},
                 {"type": "Health Condition", "value_masked": "[DIAGNOSIS_REDACTED]", "risk": "HIGH", "count": 1},
-                {"type": "Email Address", "value_masked": "j***@patientcare.org", "risk": "MEDIUM", "count": 3}
+                {"type": "Email Address", "value_masked": "j***@patientcare.org", "risk": "MEDIUM", "count": 3},
             ],
             "regulations_impacted": ["HIPAA Security Rule 45 CFR", "GDPR Article 9 (Special Category Data)"],
             "remediation_actions": [
                 "Redact SSN and medical records before transmitting to external vendors.",
-                "Enforce end-to-end encryption for stored patient intake forms."
-            ]
+                "Enforce end-to-end encryption for stored patient intake forms.",
+            ],
         },
         "sample_text": (
             "CONFIDENTIAL PATIENT INTAKE RECORD - MEMORIAL HOSPITAL\n"
@@ -271,18 +271,14 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                 "bank_name": "Chase Bank N.A.",
                 "account_type": "Checking",
                 "routing_number": "021000021",
-                "account_number_last4": "5512"
+                "account_number_last4": "5512",
             },
             "checkboxes": {
                 "agree_to_electronic_delivery": True,
                 "opt_in_401k_matching": True,
-                "parking_permit_requested": False
+                "parking_permit_requested": False,
             },
-            "signature": {
-                "is_signed": True,
-                "signed_by": "Maya Lin Rodriguez",
-                "date_signed": "2026-10-24"
-            }
+            "signature": {"is_signed": True, "signed_by": "Maya Lin Rodriguez", "date_signed": "2026-10-24"},
         },
         "sample_text": (
             "FORM HR-DD-2026: DIRECT DEPOSIT & BENEFIT AUTHORIZATION\n\n"
@@ -324,7 +320,7 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                 "email": "alex.mercer@devmail.io",
                 "phone": "+1 415-555-0144",
                 "location": "Seattle, WA",
-                "github": "github.com/alexmercer-ai"
+                "github": "github.com/alexmercer-ai",
             },
             "current_title": "Lead AI Platform Engineer",
             "total_experience_years": 8.5,
@@ -332,29 +328,25 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "skills": {
                 "languages": ["Python", "TypeScript", "Rust", "Go"],
                 "ai_frameworks": ["PyTorch", "LangChain", "LlamaIndex", "HuggingFace"],
-                "infrastructure": ["Kubernetes", "Docker", "PostgreSQL", "AWS", "Kafka"]
+                "infrastructure": ["Kubernetes", "Docker", "PostgreSQL", "AWS", "Kafka"],
             },
             "experience": [
                 {
                     "company": "Cognitive Cloud Inc",
                     "role": "Lead AI Platform Engineer",
                     "duration": "2023 - Present",
-                    "highlights": ["Architected distributed RAG serving 5M daily queries with sub-100ms latency."]
+                    "highlights": ["Architected distributed RAG serving 5M daily queries with sub-100ms latency."],
                 },
                 {
                     "company": "Neural Systems LLC",
                     "role": "Senior Backend Engineer",
                     "duration": "2020 - 2023",
-                    "highlights": ["Built high-throughput model inference pipelines in Python and FastAPI."]
-                }
+                    "highlights": ["Built high-throughput model inference pipelines in Python and FastAPI."],
+                },
             ],
             "education": [
-                {
-                    "degree": "B.S. in Computer Science",
-                    "institution": "University of Washington",
-                    "year": 2018
-                }
-            ]
+                {"degree": "B.S. in Computer Science", "institution": "University of Washington", "year": 2018}
+            ],
         },
         "sample_text": (
             "ALEX MERCER\n"
@@ -393,17 +385,11 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_query": "Identify and redact all Saudi/GCC PII, VAT numbers, CR, IBAN, and contact data.",
         "default_schema": {
             "redacted_text": "شركة الأفق للتجارة - الرقم الضريبي [REDACTED_VAT] وسجل تجاري [REDACTED_CR]...",
-            "detected_entities_count": {
-                "saudi_national_id": 1,
-                "vat_id": 1,
-                "iban": 1,
-                "phone": 1,
-                "email": 1
-            },
+            "detected_entities_count": {"saudi_national_id": 1, "vat_id": 1, "iban": 1, "phone": 1, "email": 1},
             "redacted_items": [
                 {"type": "VAT_ID", "original_snippet": "300123456789003", "replacement": "[REDACTED_VAT]"},
-                {"type": "IBAN", "original_snippet": "SA0380000000608010167519", "replacement": "[REDACTED_IBAN]"}
-            ]
+                {"type": "IBAN", "original_snippet": "SA0380000000608010167519", "replacement": "[REDACTED_IBAN]"},
+            ],
         },
         "sample_text": (
             "عقد توريد وخدمات استشارية\n"
@@ -431,7 +417,7 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "confidence_score": 0.98,
             "target_department": "Accounts Payable / Finance",
             "urgency_level": "HIGH",
-            "action_summary": "Invoice due in 5 days; forward to treasury for payment processing."
+            "action_summary": "Invoice due in 5 days; forward to treasury for payment processing.",
         },
         "sample_text": (
             "PASSENGER VEHICLE LEASE AGREEMENT\n"
@@ -463,21 +449,21 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                 "gross_profit": 8000000.0,
                 "operating_expenses": 5100000.0,
                 "operating_income_ebit": 2900000.0,
-                "net_income": 2250000.0
+                "net_income": 2250000.0,
             },
             "balance_sheet": {
                 "current_assets": 18200000.0,
                 "total_assets": 42000000.0,
                 "current_liabilities": 7500000.0,
                 "total_liabilities": 16000000.0,
-                "total_equity": 26000000.0
+                "total_equity": 26000000.0,
             },
             "financial_ratios": {
                 "gross_margin_percent": 64.0,
                 "net_profit_margin_percent": 18.0,
                 "current_ratio": 2.43,
-                "debt_to_equity_ratio": 0.62
-            }
+                "debt_to_equity_ratio": 0.62,
+            },
         },
         "sample_text": (
             "APEX TECHNOLOGIES INC. - CONDENSED CONSOLIDATED STATEMENT OF OPERATIONS\n"
@@ -507,7 +493,7 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
         "recommended_model": settings.DEFAULT_MODEL,
         "default_temperature": 0.1,
         "default_system_prompt": (
-            "You are a certified legal and financial translator between English and Arabic. Translate the provided document "
+            "You are a legal and financial document translator between English and Arabic. Translate the provided document "
             "with precise terminology preservation, maintaining numbers, dates, and tables. Return ONLY valid JSON."
         ),
         "default_query": "Translate this legal/commercial text into Arabic preserving legal phrasing and terms.",
@@ -519,8 +505,8 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "preserved_terms": [
                 {"english": "Non-Disclosure Agreement (NDA)", "arabic": "اتفاقية عدم الإفصاح"},
                 {"english": "Confidential Information", "arabic": "المعلومات السرية"},
-                {"english": "Governing Law", "arabic": "القانون الواجب التطبيق"}
-            ]
+                {"english": "Governing Law", "arabic": "القانون الواجب التطبيق"},
+            ],
         },
         "sample_text": (
             "NON-DISCLOSURE AND CONFIDENTIALITY AGREEMENT\n"
@@ -537,12 +523,12 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
         "id": "anomaly_audit",
         "name": "Anomaly & Tax Audit",
         "category": "finance",
-        "description": "Audit invoice math, ZATCA 15% VAT compliance, and date chronology.",
+        "description": "Check invoice arithmetic, the stated or configured tax rate, and date order.",
         "recommended_model": settings.DEFAULT_MODEL,
         "default_temperature": 0.0,
         "default_system_prompt": (
             "You are a forensic tax auditor. Validate mathematical integrity: check whether line item quantities * unit prices = amounts, "
-            "sum of amounts = subtotal, verify exact ZATCA 15% VAT calculation, and check due date chronology. Return ONLY valid JSON."
+            "sum of amounts = subtotal, verify the explicitly stated or configured tax calculation, and check due date chronology. Return ONLY valid JSON."
         ),
         "default_query": "Audit this invoice for mathematical mismatches, VAT errors, and chronological date conflicts.",
         "default_schema": {
@@ -554,18 +540,18 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                 "vat_stated": 1200.0,
                 "vat_expected_at_15_percent": 1500.0,
                 "vat_variance": -300.0,
-                "is_vat_valid": False
+                "is_vat_valid": False,
             },
             "chronology_check": {
                 "issue_date": "2026-10-20",
                 "due_date": "2026-10-15",
                 "is_chronology_valid": False,
-                "warning": "Due date is prior to issue date."
+                "warning": "Due date is prior to issue date.",
             },
             "discrepancies": [
-                "VAT rate stated at 12% ($1,200.00) instead of mandated ZATCA 15% rate ($1,500.00).",
-                "Due date (Oct 15) precedes invoice issue date (Oct 20)."
-            ]
+                "Review the stated 12% tax rate against the configured company rules.",
+                "Due date (Oct 15) precedes invoice issue date (Oct 20).",
+            ],
         },
         "sample_text": (
             "TAX INVOICE / فاتورة ضريبية\n"
@@ -576,7 +562,7 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "1. IT Infrastructure Consulting (40 hrs @ $200/hr) = $8,000.00\n"
             "2. Network Security License (1 unit @ $2,000/ea) = $2,000.00\n\n"
             "Subtotal: $10,000.00\n"
-            "VAT (Stated as 12%): $1,200.00  <-- Note: Should be 15% in KSA\n"
+            "VAT 12%: $1,200.00\n"
             "Total Invoiced: $11,200.00"
         ),
     },
@@ -598,17 +584,13 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "key_takeaways": [
                 "Automates 85% of manual invoice and contract workflows.",
                 "Reduces invoice processing cycle time from 4 days to 45 seconds.",
-                "Estimated annual operational savings of $420,000."
+                "Estimated annual operational savings of $420,000.",
             ],
-            "metrics": {
-                "efficiency_gain_percent": 85,
-                "annual_savings_usd": 420000,
-                "turnaround_time_seconds": 45
-            },
+            "metrics": {"efficiency_gain_percent": 85, "annual_savings_usd": 420000, "turnaround_time_seconds": 45},
             "recommended_actions": [
                 "Pilot DOCTool on 1,000 historical supplier invoices.",
-                "Integrate webhook callbacks with existing ERP system."
-            ]
+                "Integrate webhook callbacks with existing ERP system.",
+            ],
         },
         "sample_text": (
             "STRATEGIC INITIATIVE REPORT: AI DOCUMENT AUTOMATION (OCTOBER 2026)\n\n"
@@ -644,11 +626,11 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                     "columns": ["Region", "Q1_Units", "Q2_Units", "Growth_Pct"],
                     "rows": [
                         {"Region": "North America", "Q1_Units": 45000, "Q2_Units": 52000, "Growth_Pct": 15.5},
-                        {"Region": "Europe", "Q1_Units": 38000, "Q2_Units": 41500, "Growth_Pct": 9.2}
-                    ]
+                        {"Region": "Europe", "Q1_Units": 38000, "Q2_Units": 41500, "Growth_Pct": 9.2},
+                    ],
                 }
             ],
-            "total_records_extracted": 2
+            "total_records_extracted": 2,
         },
         "sample_text": (
             "QUARTERLY MANUFACTURING OUTPUT METRICS\n\n"
@@ -680,16 +662,16 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
                     "claim": "SOC 2 Type II certified annually",
                     "status": "VERIFIED",
                     "citation": "Section 4.2, Page 1",
-                    "evidence": "Audit completed by Ernst & Young on August 15, 2026."
+                    "evidence": "Audit completed by Ernst & Young on August 15, 2026.",
                 },
                 {
                     "claim": "Customer data deleted within 30 days of termination",
                     "status": "VERIFIED",
                     "citation": "Section 7.1, Page 2",
-                    "evidence": "All encrypted backups purged after 30-day grace period."
-                }
+                    "evidence": "All encrypted backups purged after 30-day grace period.",
+                },
             ],
-            "confidence_score": 0.96
+            "confidence_score": 0.96,
         },
         "sample_text": (
             "TRUST & SECURITY WHITE PAPER - CLOUD SCALE ENTERPRISE\n\n"
@@ -717,7 +699,7 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_schema": {
             "answer": "The primary deliverables are the system architecture document due on Nov 15, 2026, and the production rollout due on Dec 20, 2026.",
             "citations": ["Page 1, Paragraph 3", "Page 2, Table 1"],
-            "confidence": "High"
+            "confidence": "High",
         },
         "sample_text": (
             "PROJECT CHARTER: CLOUD INFRASTRUCTURE UPGRADE\n\n"
@@ -744,12 +726,9 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
             "document_type": "Technical Specification",
             "layout_hierarchy": [
                 {"level": 1, "heading": "System Architecture"},
-                {"level": 2, "heading": "Database Cluster"}
+                {"level": 2, "heading": "Database Cluster"},
             ],
-            "entities": [
-                {"type": "TECHNOLOGY", "text": "PostgreSQL 16"},
-                {"type": "METRIC", "text": "10,000 IOPS"}
-            ]
+            "entities": [{"type": "TECHNOLOGY", "text": "PostgreSQL 16"}, {"type": "METRIC", "text": "10,000 IOPS"}],
         },
         "sample_text": (
             "# SYSTEM ARCHITECTURE SPECIFICATION\n\n"
@@ -761,4 +740,3 @@ SERVICE_PRESETS: Dict[str, Dict[str, Any]] = {
         ),
     },
 }
-

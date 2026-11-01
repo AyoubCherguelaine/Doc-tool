@@ -65,13 +65,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_doc   ON docuchat.sessions(document_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user  ON docuchat.sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_docs_user      ON docuchat.documents(user_id);
 
--- Company Accounts (Free trial only, 1,200 initial credits, API key)
+-- Company Accounts (Free trial only, 300 initial credits, API key)
 CREATE TABLE IF NOT EXISTS docuchat.company_accounts (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id        UUID NOT NULL UNIQUE REFERENCES docuchat.users(id) ON DELETE CASCADE,
     company_name   TEXT NOT NULL DEFAULT 'Enterprise Free Trial',
     plan_tier      TEXT NOT NULL DEFAULT 'free_trial',
-    total_credits  INT NOT NULL DEFAULT 250,
+    total_credits  INT NOT NULL DEFAULT 300,
     used_credits   INT NOT NULL DEFAULT 0,
     api_key        TEXT UNIQUE NOT NULL,
     api_key_prefix TEXT NOT NULL,
@@ -95,3 +95,30 @@ CREATE TABLE IF NOT EXISTS docuchat.api_usage_logs (
 CREATE INDEX IF NOT EXISTS idx_company_user   ON docuchat.company_accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_company_apikey ON docuchat.company_accounts(api_key);
 CREATE INDEX IF NOT EXISTS idx_usage_company  ON docuchat.api_usage_logs(company_id);
+
+-- Validated services: durable request claims and company-specific rule sets.
+-- Processing claims never expire automatically: recovery must establish whether
+-- billing/execution occurred before releasing a claim after a process crash.
+CREATE TABLE IF NOT EXISTS docuchat.service_operations (
+    company_id TEXT NOT NULL,
+    operation_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing',
+    response JSONB,
+    http_status INTEGER,
+    response_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY(company_id, operation_key)
+);
+CREATE INDEX IF NOT EXISTS service_operations_response_expiry
+    ON docuchat.service_operations(response_expires_at) WHERE response IS NOT NULL;
+CREATE TABLE IF NOT EXISTS docuchat.document_rule_sets (
+    id UUID PRIMARY KEY,
+    company_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    rules JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS document_rule_sets_company ON docuchat.document_rule_sets(company_id);

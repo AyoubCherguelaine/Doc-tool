@@ -41,6 +41,7 @@ python-dotenv>=1.0.0
 # Development
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+fakeredis>=2.23
 ruff>=0.4.0
 mypy>=1.10.0
 
@@ -48,3 +49,6 @@ mypy>=1.10.0
 python-docx>=1.2.0
 openpyxl>=3.1.5
 xlrd>=2.0.1
+
+# Validated service output contracts
+jsonschema>=4.23,<5

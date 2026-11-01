@@ -151,7 +151,7 @@ export default function ConversationsPage() {
     }
   };
 
-  const remaining = account?.remainingCredits ?? 1200;
+  const remaining = account?.remainingCredits ?? 300;
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 text-slate-900 dark:text-slate-100">

@@ -16,12 +16,14 @@ rebuilt (and re-embedded) from the database if the process restarts.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import threading
 import uuid
 from pathlib import Path
 from typing import Optional
 
+from fastapi.encoders import jsonable_encoder
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -48,8 +50,8 @@ from backend.agent.agents.translation import TranslationAgent
 from backend.agent.tools.document_tools import DocumentToolKit
 from backend.agent.tools.enhanced import EnhancedDocumentKit
 from backend.chat.chatWithVSDB import get_conversation_chain, get_llm
-from backend.documents.loader import load_document
 from backend.documents.limits import MAX_DOCUMENT_PAGES, validate_page_count, validate_upload_size
+from backend.documents.loader import load_document
 from backend.documents.processors import DocumentProcessor, ProcessingConfig
 from backend.embeddings.smart_embedding import SmartEmbedding, SmartEmbeddingConfig
 from backend.embeddings.vectoreStore import SmartVectorStore
@@ -89,6 +91,8 @@ class IndexBundle:
             self.pdf_docs = [load_document(file_path)]
 
 
+logger = logging.getLogger(__name__)
+
 _registry: dict[str, IndexBundle] = {}
 _lock = threading.RLock()
 
@@ -118,6 +122,7 @@ def _pdf_path(doc_id: str) -> Path:
 
 class UploadResult(tuple):
     """Backwards-compatible tuple (chunk_count, page_count) that also holds document_id."""
+
     chunk_count: int
     page_count: int
     document_id: str
@@ -131,7 +136,11 @@ class UploadResult(tuple):
 
 
 def process_upload(
-    user_id: str, file_path: Path, original_filename: str, file_size: int, mime: str,
+    user_id: str,
+    file_path: Path,
+    original_filename: str,
+    file_size: int,
+    mime: str,
     max_pages: int = MAX_DOCUMENT_PAGES,
 ) -> UploadResult:
     """Process an uploaded document: chunk, embed-index, persist chunks.
@@ -152,6 +161,7 @@ def process_upload(
     try:
         shutil.copyfile(file_path, dest)
         from backend.storage import storage_service
+
         try:
             pdf_doc = load_document(dest)
         except ValueError:
@@ -272,6 +282,7 @@ def stream_chat(
     model_name: str = settings.DEFAULT_MODEL,
     mode: str = "conversational",
     response_style: str = "balanced",
+    service_options=None,
 ):
     """Yield streamed text chunks for a user turn.
 
@@ -299,12 +310,28 @@ def stream_chat(
     query = query + "\n\nResponse preference: " + instruction
 
     agent_modes = {
-        "agent", "summary", "research", "extraction",
-        "comparison", "factcheck", "coordinator", "invoice", "contract", "google_ai",
-        "receipt", "resume", "compliance", "form_parser",
+        "agent",
+        "summary",
+        "research",
+        "extraction",
+        "comparison",
+        "factcheck",
+        "coordinator",
+        "invoice",
+        "contract",
+        "google_ai",
+        "receipt",
+        "resume",
+        "compliance",
+        "form_parser",
+        "redaction",
+        "classifier",
+        "financial_statement",
+        "translation",
+        "anomaly_audit",
     }
     if mode in agent_modes:
-        yield from _stream_agent(bundle, query, history, model_name, mode)
+        yield from _stream_agent(bundle, query, history, model_name, mode, service_options=service_options)
     else:
         yield from _stream_conversational(bundle, query, history, model_name)
 
@@ -360,8 +387,10 @@ def _build_toolkit(
 def create_text_bundle(text: str, name: str = "sample_document.txt") -> IndexBundle:
     """Create a lightweight in-memory IndexBundle from raw text for playground and quick runs."""
     import uuid
-    from backend.documents.pdf_loader import PageText, PDFDocument
+
     from langchain_core.documents import Document as LCDocument
+
+    from backend.documents.pdf_loader import PageText, PDFDocument
 
     doc_id = "mem-" + str(uuid.uuid4())[:8]
     bundle = IndexBundle(doc_id)
@@ -378,8 +407,9 @@ def create_text_bundle(text: str, name: str = "sample_document.txt") -> IndexBun
         bundle.vector_store = SmartVectorStore(embedding=emb).build(chunks)
     except Exception as exc:
         logger.warning("Could not build SmartVectorStore for text bundle, falling back: %s", exc)
-        from langchain_community.vectorstores import FAISS
         from langchain_community.embeddings import FakeEmbeddings
+        from langchain_community.vectorstores import FAISS
+
         bundle.vector_store = FAISS.from_documents(chunks, FakeEmbeddings(size=1536))
 
     with _lock:
@@ -396,9 +426,21 @@ def _build_agent(
 ) -> BaseAgent:
     """Factory: build the appropriate agent for the requested mode."""
     use_enhanced = mode in {
-        "extraction", "factcheck", "coordinator", "invoice", "contract", "google_ai",
-        "receipt", "resume", "compliance", "form_parser",
-        "redaction", "classifier", "financial_statement", "translation", "anomaly_audit",
+        "extraction",
+        "factcheck",
+        "coordinator",
+        "invoice",
+        "contract",
+        "google_ai",
+        "receipt",
+        "resume",
+        "compliance",
+        "form_parser",
+        "redaction",
+        "classifier",
+        "financial_statement",
+        "translation",
+        "anomaly_audit",
     }
     toolkit = _build_toolkit(bundle, model_name, enhanced=use_enhanced, temperature=temperature)
 
@@ -563,17 +605,41 @@ def _stream_agent(
     history: list,
     model_name: str,
     mode: str = "agent",
+    service_options=None,
 ):
-    agent = _build_agent(bundle, model_name, mode)
 
     recent = "\n".join(f"{m.type}: {m.content}" for m in history[-10:])
-    full_query = (
-        "Conversation context (for reference only):\n"
-        + recent
-        + "\n\nCurrent request:\n"
-        + query
-    )
-    result = agent.run(full_query)
-    text = result.response or ""
+    full_query = "Conversation context (for reference only):\n" + recent + "\n\nCurrent request:\n" + query
+    from backend.services.contracts import FIELDS
+
+    if mode in FIELDS:
+        from backend.services.engine import run_validated
+        from backend.services.models import ServiceOptions, ServiceRequest
+
+        validated = run_validated(
+            ServiceRequest(
+                service=mode,
+                document_id=bundle.doc_id,
+                query=full_query,
+                model=model_name,
+                options=service_options or ServiceOptions(),
+            ),
+            bundle,
+        )
+        import json
+
+        text = json.dumps(
+            jsonable_encoder(
+                {"data": validated["data"], "fieldEvidence": validated["fieldEvidence"], "checks": validated["checks"]}
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    else:
+        agent = _build_agent(bundle, model_name, mode)
+        result = agent.run(full_query)
+        if not result.success:
+            raise RuntimeError("Service execution failed")
+        text = result.response or ""
     for i in range(0, len(text), 60):
         yield text[i : i + 60]

@@ -1,5 +1,7 @@
 # DOC Tool Document AI — Complete API Reference & Developer Guide
 
+For output validation, source evidence, configurable tax and translation options, invoice/PO matching, contract version comparison, company rules and idempotent requests, see [Validated document services](DOCUMENT_SERVICES.md).
+
 Welcome to the **DOC Tool Document AI** API documentation. This platform delivers enterprise-grade, stateless Document Intelligence powered by high-accuracy vision models.
 
 ---
@@ -11,7 +13,7 @@ Welcome to the **DOC Tool Document AI** API documentation. This platform deliver
 - **Configurable TTL**: Configure the inactivity window via `DOC_TTL_MINUTES=10` in environment or per-upload via `ttl_minutes`.
 - **Zero Permanent Retention**: If 10 minutes elapse without usage, all associated files, embeddings, and temporary memory buffers are automatically wiped.
 - **Authentication**: Authenticate using your company API key (`docu_live_...`) or session Bearer JWT.
-- **Credit Billing**: Every API call atomically verifies and deducts credits from your company balance (starts with **1,200 free trial credits**).
+- **Credit Billing**: Every API call atomically verifies and deducts credits from your company balance (starts with **300 free trial credits**).
 
 ---
 
@@ -97,7 +99,7 @@ curl -X GET "http://localhost:8000/api/v1/models"
 
 DOC Tool operates on a transparent, pay-per-call credit system.
 
-- **Free Trial Allocation**: **1,200 Free Trial Credits** are instantly granted to every company account upon creation.
+- **Free Trial Allocation**: **300 Free Trial Credits** are instantly granted to every company account upon creation.
 - **Atomic Deduction**: Balance is verified before execution and deducted atomically in a database transaction with audit logging.
 - **Zero Balance Behavior**: If remaining credits are lower than the service cost, returns `402 Payment Required`.
 
@@ -115,7 +117,7 @@ curl -X GET "http://localhost:8000/api/v1/company/pricing"
 #### Response:
 ```json
 {
-  "initialTrialCredits": 1200,
+  "initialTrialCredits": 300,
   "services": [
     {
       "id": "chat",
@@ -288,9 +290,9 @@ GET /api/v1/company/account
   "companyId": "c4b3a1d0-1234-5678-9abc-def012345678",
   "companyName": "Acme Corp",
   "planTier": "free_trial",
-  "totalCredits": 1200,
-  "usedCredits": 175,
-  "remainingCredits": 1025,
+  "totalCredits": 300,
+  "usedCredits": 75,
+  "remainingCredits": 225,
   "apiKeyPrefix": "docu_live_ab12",
   "createdAt": "2026-10-27T10:00:00Z"
 }
@@ -490,7 +492,7 @@ DOC Tool includes a built-in **MCP Server** for instant integration with **Claud
 
 ### Available MCP Tools:
 - `docuchat_advanced_ocr`: Run layout-aware vision OCR on any local PDF file.
-- `docuchat_run_service`: Run any of the 19 Document AI services.
+- `docuchat_run_service`: Run services from the current document service catalog.
 - `docuchat_get_company_credits`: Check company credit balance and service rates.
 - `docuchat_list_models`: List available models (`gpt-6-luna`).
 

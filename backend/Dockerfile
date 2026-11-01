@@ -10,7 +10,8 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the backend application code
+# Copy the backend application code and models config
+COPY models.json ./models.json
 COPY backend/ ./backend/
 
 # Ensure runtime directories exist (populated volumes are excluded from the build)

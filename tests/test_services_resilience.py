@@ -30,6 +30,13 @@ from backend.documents.pdf_loader import PageText, PDFDocument
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def shared_document_query(monkeypatch):
+    # Existing endpoint tests patch server.query for ownership. The shared executor
+    # performs the same ownership query in its own module.
+    monkeypatch.setattr("backend.services.engine.query", lambda *args, **kwargs: server.query(*args, **kwargs))
+
+
 @pytest.fixture
 def mock_user():
     return {"id": str(uuid.uuid4()), "name": "ResilienceTester"}
@@ -288,7 +295,7 @@ def test_company_service_refunds_credits_on_agent_failure(client, monkeypatch):
         error="429 RateLimitError",
         iterations=1,
     )
-    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode: mock_agent)
+    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode, **kwargs: mock_agent)
 
     # Call /api/v1/services/comparison with company API key
     headers = {"X-API-Key": account.api_key}
@@ -320,7 +327,7 @@ def test_company_service_refunds_credits_on_unexpected_exception(client, monkeyp
     # Mock agent that raises an unexpected exception
     mock_agent = MagicMock()
     mock_agent.run.side_effect = RuntimeError("Synthetic worker failure for refund test")
-    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode: mock_agent)
+    monkeypatch.setattr(server.rag, "_build_agent", lambda bundle, model, mode, **kwargs: mock_agent)
 
     headers = {"X-API-Key": account.api_key}
     res = client.post(
@@ -329,7 +336,9 @@ def test_company_service_refunds_credits_on_unexpected_exception(client, monkeyp
         json={"document_id": "doc-uuid", "query": "extract invoice"},
     )
 
-    # Must return 500 with refund confirmation
-    assert res.status_code == 500
-    assert "Credits refunded" in res.json()["detail"]
+    # All service adapters use the same failed-result envelope and refund policy.
+    assert res.status_code == 200
+    assert res.json()["success"] is False
+    assert res.json()["creditsDeducted"] == 0
+    assert res.json()["creditsRefunded"] > 0
     assert account.remaining_credits == initial_credits

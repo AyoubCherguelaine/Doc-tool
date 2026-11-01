@@ -2,12 +2,14 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Search, X } from "lucide-react";
+import { ArrowRight, Search, X, Sparkles } from "lucide-react";
 import { useLanguage } from "@/components/providers/language-provider";
+import { useModelSettings } from "@/components/providers/model-provider";
 import { serviceCatalog, serviceCategories } from "@/lib/service-catalog";
 
 export function ServiceCatalog({ preview = false }: { preview?: boolean }) {
   const { language, t } = useLanguage();
+  const { calculateCost, selectedModelInfo } = useModelSettings();
   const [category, setCategory] = useState("all");
   const [query, setQuery] = useState("");
   const normalize = (value: string) =>
@@ -129,17 +131,25 @@ export function ServiceCatalog({ preview = false }: { preview?: boolean }) {
                 <span className="rounded-xl bg-emerald-50 p-2.5 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
                   <service.icon size={22} />
                 </span>
-                {!preview && (
-                  <span className="text-xs text-slate-500 dark:text-slate-400">
-                    {service.credits}{" "}
-                    {t(
-                      service.id === "chat"
-                        ? "credit / question"
-                        : "credits / run",
-                      service.id === "chat" ? "رصيد / سؤال" : "رصيد / تشغيل",
-                    )}
-                  </span>
-                )}
+                {!preview && (() => {
+                  const pricing = calculateCost(service.credits);
+                  return (
+                    <div className="flex flex-col items-end">
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200 font-mono">
+                        {pricing.totalCredits}{" "}
+                        {t(
+                          service.id === "chat"
+                            ? "cr / question"
+                            : "cr / run",
+                          service.id === "chat" ? "رصيد / سؤال" : "رصيد / تشغيل",
+                        )}
+                      </span>
+                      <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-mono">
+                        ≈ {pricing.costUsdFormatted} USD
+                      </span>
+                    </div>
+                  );
+                })()}
               </div>
               <h3 className="text-base font-semibold">
                 {service.title[language]}

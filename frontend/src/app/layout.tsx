@@ -4,6 +4,7 @@ import "./globals.css";
 import { SessionProvider } from "@/components/providers/session-provider";
 import { LanguageProvider } from "@/components/providers/language-provider";
 import { ThemeProvider } from "@/components/providers/theme-provider";
+import { ModelProvider } from "@/components/providers/model-provider";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -55,7 +56,11 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} h-full antialiased bg-white text-slate-900 dark:bg-[#090d12] dark:text-slate-100 transition-colors duration-150`}
       >
         <ThemeProvider>
-          <LanguageProvider><SessionProvider>{children}</SessionProvider></LanguageProvider>
+          <LanguageProvider>
+            <SessionProvider>
+              <ModelProvider>{children}</ModelProvider>
+            </SessionProvider>
+          </LanguageProvider>
         </ThemeProvider>
       </body>
     </html>

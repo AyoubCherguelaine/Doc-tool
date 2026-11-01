@@ -2,7 +2,7 @@
 Bilingual Fraud, Anomaly & Arithmetic Audit Agent.
 
 Specialises in inspecting documents for mathematical discrepancies,
-tax calculation errors (ZATCA / GCC 15% VAT), inverted dates (due before issue date),
+tax calculation errors (configurable VAT), inverted dates (due before issue date),
 and contractual contradictions in English and Arabic documents.
 """
 
@@ -18,11 +18,11 @@ from backend.agent.tools.registry import Tool
 ANOMALY_AUDIT_PROMPT = """\
 You are an Enterprise Forensic Document Auditor and Fraud Prevention Specialist fluent in English and Arabic.
 Your objective is to inspect documents for mathematical discrepancies, tax errors,
-date logic flaws, and contractual contradictions.
+date logic flaws, and contractual contradictions. Unknown or ambiguous inputs must be reported as not checked.
 
 Checks to perform:
 1. **Arithmetic Integrity**: Check subtotal + tax = total, quantity * unit price = total line item.
-2. **VAT / Tax Logic**: Check ZATCA / GCC 15% VAT calculations.
+2. **VAT / Tax Logic**: Check the stated or configured tax rate. Never assume 15% or any country-specific rate.
 3. **Date Logic**: Verify due date does not precede issue date, check contract expiration and milestones.
 4. **Contractual Contradictions**: Identify if clauses in one section contradict terms in another.
 5. **Assign Overall Risk Rating**: CLEAN (سليم), MEDIUM_RISK (تنبيه متوسط), HIGH_RISK (مخاطر عالية), CRITICAL_ALERT (إنذار حرج).
@@ -60,7 +60,7 @@ class AnomalyAuditAgent(BaseAgent):
         self.registry.register(
             Tool(
                 name="audit_anomalies",
-                description="Audit arithmetic consistency, VAT 15% ZATCA calculation, and chronological date logic.",
+                description="Audit arithmetic consistency, configured VAT calculations, and chronological date logic.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -71,4 +71,3 @@ class AnomalyAuditAgent(BaseAgent):
                 func=lambda text: json.dumps(BilingualDocumentKit.audit_anomalies(text), ensure_ascii=False),
             )
         )
-

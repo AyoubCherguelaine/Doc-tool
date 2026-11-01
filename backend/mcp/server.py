@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
+from fastapi.encoders import jsonable_encoder
 from mcp.server import MCPServer
 
 logger = logging.getLogger("docuchat.mcp")
@@ -70,59 +71,48 @@ def _execute_service_inprocess(
     document_id: str,
     service_name: str,
     query: Optional[str] = None,
+    options: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute service directly in-process via backend.rag and backend.billing."""
-    from backend import rag
+    """MCP shares service validation, ownership checks, billing and optional durable replay."""
+    from fastapi import HTTPException
+
     from backend.billing import billing_service
-    from backend.config import settings
+    from backend.services.engine import execute_service
+    from backend.services.idempotency import begin, finish, finish_error
+    from backend.services.models import ServiceRequest
 
     account = billing_service.get_company_by_api_key(_get_api_key())
     if not account:
-        account = billing_service.get_or_create_company("00000000-0000-0000-0000-000000000001", "MCP Client")
-
-    cost = billing_service.get_service_cost(service_name)
-    if account.remaining_credits < cost:
-        return {
-            "error": f"Insufficient credits for {service_name}. Required: {cost}, Remaining: {account.remaining_credits}.",
-            "success": False,
-        }
-
+        return {"success": False, "error": "MCP company account not found"}
+    operation_key = None
     try:
-        bundle = rag.get_bundle(document_id)
-    except Exception as exc:
-        return {"error": f"Document '{document_id}' not found: {exc}", "success": False}
-
-    if bundle.vector_store is None:
-        return {"error": "Document index not ready.", "success": False}
-
-    try:
-        remaining = billing_service.check_and_deduct_credits(
-            account=account,
-            service_name=service_name,
-            document_id=document_id,
-            request_summary=query or f"MCP execution: {service_name}",
+        request = ServiceRequest(
+            document_id=document_id, service=service_name, query=query or None, options=options or {}
         )
-    except Exception as exc:
-        return {"error": str(exc), "success": False}
-
-    model = settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode=service_name)
-    task_prompt = query or f"Perform complete {service_name} processing and structured analysis."
-
-    try:
-        res = agent.run(task_prompt)
-        if not res.success:
-            billing_service.refund_credits(account, service_name, cost, document_id, res.error or "Agent failed")
-            return {"error": res.error, "response": res.response, "success": False}
-        return {
-            "response": res.response,
-            "success": True,
-            "credits_deducted": cost,
-            "credits_remaining": remaining,
-        }
-    except Exception as exc:
-        billing_service.refund_credits(account, service_name, cost, document_id, str(exc))
-        return {"error": f"Service execution error: {exc}", "success": False}
+        operation_key, replay = begin(account, "mcp", idempotency_key, request.model_dump(mode="json"))
+        if replay:
+            return replay["body"]
+        body = execute_service(request, account)
+        body.update(
+            response=json.dumps(
+                jsonable_encoder(
+                    {"data": body.get("data"), "fieldEvidence": body.get("fieldEvidence"), "checks": body.get("checks")}
+                ),
+                ensure_ascii=False,
+            )
+            if body.get("data") is not None
+            else body.get("raw", ""),
+            credits_deducted=body.get("creditsDeducted", 0),
+            credits_remaining=body.get("creditsRemaining"),
+        )
+        finish(account, operation_key, body)
+        return body
+    except HTTPException as exc:
+        finish_error(account, operation_key, exc)
+        return {"success": False, "error": str(exc.detail)}
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +167,7 @@ def docuchat_list_documents(limit: int = 20) -> str:
     except Exception:
         from backend import rag
 
-        cached = [
-            {"id": doc_id, "ready": b.vector_store is not None}
-            for doc_id, b in rag._registry.items()
-        ]
+        cached = [{"id": doc_id, "ready": b.vector_store is not None} for doc_id, b in rag._registry.items()]
         return json.dumps({"documents": cached, "count": len(cached)}, indent=2)
 
 
@@ -411,7 +398,9 @@ def docuchat_compare_documents(
 ) -> str:
     """Compare two documents side-by-side."""
     prompt = f"Compare document {document_id_a} and document {document_id_b}. Focus on: {query or 'key terms, discrepancies, and revisions'}."
-    res = _execute_service_inprocess(document_id_a, "comparison", prompt)
+    res = _execute_service_inprocess(
+        document_id_a, "contract_comparison", prompt, options={"reference_document_id": document_id_b}
+    )
     return res.get("response") or res.get("error", "Failed to compare documents.")
 
 
@@ -431,7 +420,9 @@ def docuchat_redact_document(document_id: str, query: str = "") -> str:
 )
 def docuchat_classify_document(document_id: str) -> str:
     """Classify document and determine target department and priority."""
-    res = _execute_service_inprocess(document_id, "classifier", "Classify this document category, language, and routing department.")
+    res = _execute_service_inprocess(
+        document_id, "classifier", "Classify this document category, language, and routing department."
+    )
     return res.get("response") or res.get("error", "Failed to classify document.")
 
 
@@ -452,13 +443,18 @@ def docuchat_analyze_financial_statement(document_id: str, query: str = "") -> s
 def docuchat_translate_document(document_id: str, target_language: str = "Arabic") -> str:
     """Translate document content accurately preserving legal and financial terminology."""
     prompt = f"Translate this document into {target_language}. Maintain all clause numbering, tables, formatting, and legal terminology."
-    res = _execute_service_inprocess(document_id, "translation", prompt)
+    target = {"arabic": "ar", "english": "en", "ar": "ar", "en": "en"}.get(target_language.lower())
+    if target is None:
+        return "Target language must be Arabic/ar or English/en"
+    res = _execute_service_inprocess(
+        document_id, "translation", prompt, options={"translation": {"target_language": target}}
+    )
     return res.get("response") or res.get("error", "Failed to translate document.")
 
 
 @mcp_server.tool(
     name="docuchat_audit_anomalies",
-    description="Audit document for mathematical discrepancies, ZATCA VAT 15% calculation errors, date inversions, and contractual contradictions.",
+    description="Audit document for mathematical discrepancies, configured tax calculation errors, date inversions, and contractual contradictions.",
 )
 def docuchat_audit_anomalies(document_id: str, query: str = "") -> str:
     """Perform forensic arithmetic, tax, and date consistency audit."""
@@ -615,3 +611,19 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+@mcp_server.tool(
+    name="docuchat_run_validated_service",
+    description="Run a document service with validated output, source evidence and configurable options. Supports invoice_matching, contract_comparison, document_checks, translation and existing services.",
+)
+def docuchat_run_validated_service(
+    document_id: str,
+    service: str,
+    options: Optional[Dict[str, Any]] = None,
+    query: str = "",
+    idempotency_key: Optional[str] = None,
+) -> str:
+    return json.dumps(
+        jsonable_encoder(_execute_service_inprocess(document_id, service, query, options, idempotency_key)),
+        ensure_ascii=False,
+    )

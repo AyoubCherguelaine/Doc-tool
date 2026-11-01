@@ -1,7 +1,7 @@
 """
 Company Billing & API Usage Service.
 
-Handles company free trial allocation (1,200 credits), API key generation,
+Handles company free trial allocation (300 credits), API key generation,
 per-service pricing based on LLM compute intensity, credit validation,
 atomic deductions, and usage audit logging.
 """
@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-INITIAL_TRIAL_CREDITS = 1200
+INITIAL_TRIAL_CREDITS = 300
 API_KEY_PREFIX = "docu_live_"
 
 # ---------------------------------------------------------------------------
@@ -148,15 +148,43 @@ SERVICE_PRICING: Dict[str, Dict[str, Any]] = {
         "name": "Legal & Enterprise Translation",
         "credits": 20,
         "llm_tier": "Moderate",
-        "description": "Certified bidirectional EN ↔ AR translation preserving document layout, tables, and legal clauses",
+        "description": "Bidirectional EN ↔ AR translation with glossary and number-preservation checks",
         "category": "Localization",
     },
     "anomaly_audit": {
         "name": "Fraud & Anomaly Audit",
         "credits": 25,
         "llm_tier": "Moderate-Heavy",
-        "description": "Forensic audit for arithmetic errors, ZATCA VAT 15%, inverted dates, and contractual contradictions",
+        "description": "Arithmetic checks with configurable tax rates, rounding tolerances and date order",
         "category": "Audit & Risk",
+    },
+    "invoice_matching": {
+        "name": "Invoice and Purchase Order Matching",
+        "credits": 50,
+        "llm_tier": "Two-document extraction",
+        "category": "Finance",
+        "description": "Compare item quantities, prices, amounts and totals with source evidence",
+    },
+    "contract_comparison": {
+        "name": "Contract Version Comparison",
+        "credits": 15,
+        "llm_tier": "Deterministic text comparison",
+        "category": "Legal",
+        "description": "Compare contract versions with before/after text and page references",
+    },
+    "document_checks": {
+        "name": "Configurable Document Checks",
+        "credits": 20,
+        "llm_tier": "Extraction and deterministic rules",
+        "category": "Workflow Automation",
+        "description": "Check required fields, allowed values and company approval thresholds",
+    },
+    "advanced_ocr": {
+        "name": "Advanced Semantic OCR",
+        "credits": 5,
+        "llm_tier": "Vision Layout OCR",
+        "description": "Extract layout-aware semantic blocks, markdown tables, and reading direction",
+        "category": "Extraction",
     },
 }
 
@@ -227,13 +255,14 @@ class CompanyBillingService:
         """Ensure company billing tables exist in Postgres."""
         try:
             from backend.db import execute
+
             execute("""
                 CREATE TABLE IF NOT EXISTS docuchat.company_accounts (
                     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     user_id        UUID NOT NULL UNIQUE REFERENCES docuchat.users(id) ON DELETE CASCADE,
                     company_name   TEXT NOT NULL DEFAULT 'Enterprise Free Trial',
                     plan_tier      TEXT NOT NULL DEFAULT 'free_trial',
-                    total_credits  INT NOT NULL DEFAULT 250,
+                    total_credits  INT NOT NULL DEFAULT 300,
                     used_credits   INT NOT NULL DEFAULT 0,
                     api_key        TEXT UNIQUE NOT NULL,
                     api_key_prefix TEXT NOT NULL,
@@ -265,7 +294,7 @@ class CompanyBillingService:
         user_id: str,
         company_name: Optional[str] = None,
     ) -> CompanyAccount:
-        """Get or initialize a company account with 1,200 free trial credits."""
+        """Get or initialize a company account with 300 free trial credits."""
         user_id_str = str(user_id)
         with self._lock:
             # 1. Check in-memory store
@@ -275,6 +304,7 @@ class CompanyBillingService:
             # 2. Check Database if available
             try:
                 from backend.db import query
+
                 row = query(
                     "SELECT id, user_id, company_name, plan_tier, total_credits, used_credits, "
                     "api_key, api_key_prefix, is_active, created_at, updated_at "
@@ -293,8 +323,12 @@ class CompanyBillingService:
                         api_key=row["api_key"],
                         api_key_prefix=row["api_key_prefix"],
                         is_active=bool(row["is_active"]),
-                        created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
-                        updated_at=row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else str(row["updated_at"]),
+                        created_at=row["created_at"].isoformat()
+                        if hasattr(row["created_at"], "isoformat")
+                        else str(row["created_at"]),
+                        updated_at=row["updated_at"].isoformat()
+                        if hasattr(row["updated_at"], "isoformat")
+                        else str(row["updated_at"]),
                     )
                     self._cache_account(account)
                     return account
@@ -304,9 +338,12 @@ class CompanyBillingService:
             # Auto-ensure tables exist in database on first provision
             self.ensure_tables()
 
-            # 3. Create fresh free trial account (1,200 credits)
+            # 3. Create fresh free trial account (300 credits)
             account_id = str(uuid.uuid4())
-            name = company_name or "Enterprise Free Trial"
+            if company_name and company_name.strip() and company_name.strip() != "Enterprise Free Trial":
+                name = company_name.strip()
+            else:
+                name = f"User-{user_id_str[:6]}'s Workspace"
             api_key = self._generate_raw_api_key()
             prefix = api_key[:14]
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -328,6 +365,7 @@ class CompanyBillingService:
             # Persist to database if table exists
             try:
                 from backend.db import execute
+
                 execute(
                     "INSERT INTO docuchat.company_accounts "
                     "(id, user_id, company_name, plan_tier, total_credits, used_credits, api_key, api_key_prefix, is_active) "
@@ -366,6 +404,7 @@ class CompanyBillingService:
 
             try:
                 from backend.db import query
+
                 row = query(
                     "SELECT id, user_id, company_name, plan_tier, total_credits, used_credits, "
                     "api_key, api_key_prefix, is_active, created_at, updated_at "
@@ -406,6 +445,7 @@ class CompanyBillingService:
             # Try DB
             try:
                 from backend.db import query
+
                 row = query(
                     "SELECT id, user_id, company_name, plan_tier, total_credits, used_credits, "
                     "api_key, api_key_prefix, is_active, created_at, updated_at "
@@ -452,6 +492,7 @@ class CompanyBillingService:
             # Update DB
             try:
                 from backend.db import execute
+
                 execute(
                     "UPDATE docuchat.company_accounts SET api_key = %s, api_key_prefix = %s, updated_at = now() WHERE id = %s",
                     (new_key, new_key[:14], account.id),
@@ -462,13 +503,59 @@ class CompanyBillingService:
             self._cache_account(account)
             return account
 
-    def get_service_cost(self, service_name: str) -> int:
-        """Get the required credits cost for a given service."""
+    def update_workspace_name(self, user_id: str, new_name: str) -> CompanyAccount:
+        """Update the workspace display name for a user's account."""
+        account = self.get_or_create_company(user_id)
+        with self._lock:
+            account.company_name = new_name.strip()
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            account.updated_at = now_iso
+            try:
+                from backend.db import execute
+
+                execute(
+                    "UPDATE docuchat.company_accounts SET company_name = %s, updated_at = now() WHERE user_id = %s",
+                    (account.company_name, str(user_id)),
+                )
+            except Exception:
+                pass
+            self._cache_account(account)
+            return account
+
+    GUARDIAN_CREDIT_FEE: int = 5
+
+    def get_service_cost(
+        self,
+        service_name: str,
+        model_id: Optional[str] = None,
+        guardian: bool = True,
+        model: Optional[str] = None,
+    ) -> int:
+        """Get the required credits cost for a given service, factoring in chosen model and Guardian verification.
+        
+        When guardian is True, the Guardian runs full evidence and rule validation and takes credit.
+        When guardian is False, the service returns values directly and bypasses the Guardian fee.
+        """
+        if model and not model_id:
+            model_id = model
         info = SERVICE_PRICING.get(service_name)
-        if not info:
-            # Fallback for unknown service
-            return 10
-        return info["credits"]
+        base_cost = info["credits"] if info else 10
+        total_cost = base_cost
+        if model_id is not None:
+            try:
+                from backend.models_config import model_registry
+
+                calc = model_registry.calculate_service_cost(base_cost, model_id)
+                total_cost = calc["total_credits"]
+            except Exception:
+                total_cost = base_cost
+
+        # If Guardian is disabled (direct value return mode), discount the guardian fee (except OCR)
+        if not guardian and service_name != "advanced_ocr":
+            discount = min(self.GUARDIAN_CREDIT_FEE, max(0, total_cost - 1))
+            total_cost = max(1, total_cost - discount)
+
+        return total_cost
 
     def check_and_deduct_credits(
         self,
@@ -476,6 +563,8 @@ class CompanyBillingService:
         service_name: str,
         document_id: Optional[str] = None,
         request_summary: Optional[str] = None,
+        model_id: Optional[str] = None,
+        guardian: bool = True,
     ) -> int:
         """Atomically verify and deduct credits for a service call.
 
@@ -485,7 +574,7 @@ class CompanyBillingService:
         Returns:
             int: Remaining credits after deduction.
         """
-        cost = self.get_service_cost(service_name)
+        cost = self.get_service_cost(service_name, model_id=model_id, guardian=guardian)
         with self._lock:
             remaining = account.remaining_credits
             if remaining < cost:
@@ -498,6 +587,7 @@ class CompanyBillingService:
             # Update DB
             try:
                 from backend.db import execute
+
                 execute(
                     "UPDATE docuchat.company_accounts SET used_credits = used_credits + %s, updated_at = now() WHERE id = %s",
                     (cost, account.id),
@@ -526,6 +616,7 @@ class CompanyBillingService:
             # Persist log to DB
             try:
                 from backend.db import execute
+
                 execute(
                     "INSERT INTO docuchat.api_usage_logs (id, company_id, service_name, credits_cost, document_id, request_summary, status) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
@@ -559,6 +650,7 @@ class CompanyBillingService:
             # Update DB
             try:
                 from backend.db import execute
+
                 execute(
                     "UPDATE docuchat.company_accounts SET used_credits = %s, updated_at = now() WHERE id = %s",
                     (account.used_credits, account.id),
@@ -587,10 +679,19 @@ class CompanyBillingService:
             # Persist log to DB
             try:
                 from backend.db import execute
+
                 execute(
                     "INSERT INTO docuchat.api_usage_logs (id, company_id, service_name, credits_cost, document_id, request_summary, status) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (log_id, account.id, service_name, -cost, document_id, f"REFUND: {reason or 'Service execution failure'}", "refunded"),
+                    (
+                        log_id,
+                        account.id,
+                        service_name,
+                        -cost,
+                        document_id,
+                        f"REFUND: {reason or 'Service execution failure'}",
+                        "refunded",
+                    ),
                 )
             except Exception:
                 pass
@@ -616,6 +717,7 @@ class CompanyBillingService:
             # Check DB
             try:
                 from backend.db import query
+
                 rows = query(
                     "SELECT id, company_id, service_name, credits_cost, document_id, request_summary, status, created_at "
                     "FROM docuchat.api_usage_logs WHERE company_id = %s ORDER BY created_at DESC LIMIT %s",
@@ -630,7 +732,9 @@ class CompanyBillingService:
                             "documentId": str(r["document_id"]) if r["document_id"] else None,
                             "requestSummary": r["request_summary"],
                             "status": r["status"],
-                            "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"]),
+                            "createdAt": r["created_at"].isoformat()
+                            if hasattr(r["created_at"], "isoformat")
+                            else str(r["created_at"]),
                         }
                         for r in rows
                     ]

@@ -26,6 +26,7 @@ import {
   X,
   ExternalLink,
   ShieldCheck,
+  ShieldAlert,
   Terminal,
   Zap,
   Timer,
@@ -52,16 +53,24 @@ import {
 import type { Document } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { useModelSettings } from "@/components/providers/model-provider";
 
 export default function PlaygroundPage() {
   const { t, language: interfaceLanguage } = useLanguage();
+  const { availableModels, selectedModel, guardianMode, calculateCost } = useModelSettings();
   const searchParams = useSearchParams();
   const router = useRouter();
   const serviceKey = searchParams.get("service") || "invoice";
   const initialShowCode = searchParams.get("code") === "true";
 
   const [preset, setPreset] = useState<PlaygroundPreset | null>(null);
-  const [defaultEnvModel, setDefaultEnvModel] = useState<string>("gpt-6-luna");
+  const [defaultEnvModel, setDefaultEnvModel] = useState<string>("gpt-4o-mini");
+  const [currentModel, setCurrentModel] = useState<string>(selectedModel);
+  const [guardianEnabled, setGuardianEnabled] = useState<boolean>(guardianMode);
+
+  useEffect(() => {
+    setGuardianEnabled(guardianMode);
+  }, [guardianMode]);
   const [docs, setDocs] = useState<Document[]>([]);
   const [account, setAccount] = useState<CompanyAccountInfo | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -110,8 +119,9 @@ export default function PlaygroundPage() {
     ])
       .then(([presetData, docList, accData]) => {
         if (!active) return;
-        const envModel = presetData.defaultModel || "gpt-6-luna";
+        const envModel = presetData.defaultModel || selectedModel || "gpt-4o-mini";
         setDefaultEnvModel(envModel);
+        if (!currentModel) setCurrentModel(envModel);
         setDocs(docList);
         if (accData) {
           setAccount(accData);
@@ -218,10 +228,11 @@ export default function PlaygroundPage() {
 
     const payload: any = {
       service: serviceKey,
-      model: defaultEnvModel,
+      model: currentModel || defaultEnvModel,
       user_prompt: userPrompt || undefined,
       schema_override: parsedSchema,
       output_format: "json",
+      guardian: guardianEnabled,
     };
 
     if (sourceType === "document" && selectedDocId) {
@@ -239,6 +250,9 @@ export default function PlaygroundPage() {
       })
       .finally(() => {
         setIsRunning(false);
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("doctool:credit-updated"));
+        }
       });
   };
 
@@ -639,13 +653,44 @@ console.log("TTL Status:", status);`;
               <span className="font-mono text-slate-700 uppercase tracking-wider text-[11px] font-semibold">{serviceKey}</span>
             </div>
 
-            <div className="mt-1 flex items-center gap-2.5">
+            <div className="mt-1 flex flex-wrap items-center gap-2.5">
               <h1 className="text-xl font-bold tracking-tight text-slate-900">
                 {serviceTitle}
               </h1>
-              <span className="rounded-md bg-slate-900 px-2 py-0.5 font-mono text-[10px] font-semibold text-slate-200">
-                {defaultEnvModel}
-              </span>
+              <div className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2 py-0.5 shadow-2xs">
+                <span className="text-[10px] text-slate-400 uppercase font-semibold">Model:</span>
+                <select
+                  value={currentModel || defaultEnvModel}
+                  onChange={(e) => setCurrentModel(e.target.value)}
+                  className="bg-transparent font-mono text-[11px] font-bold text-slate-800 outline-none cursor-pointer"
+                >
+                  {availableModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} ({m.credit_cost} cr • ${(m.credit_cost * 0.002).toFixed(3)})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Guardian Mode Pill */}
+              <button
+                type="button"
+                onClick={() => setGuardianEnabled(!guardianEnabled)}
+                title={guardianEnabled ? "Guardian Verification Active (+5 cr)" : "Direct Return (Guardian Waived)"}
+                className={`flex items-center gap-1.5 rounded-lg border px-2 py-0.5 shadow-2xs font-mono text-[11px] font-semibold transition cursor-pointer ${
+                  guardianEnabled
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                    : "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                }`}
+              >
+                {guardianEnabled ? (
+                  <ShieldCheck size={13} className="text-emerald-600" />
+                ) : (
+                  <ShieldAlert size={13} className="text-amber-600" />
+                )}
+                <span>{guardianEnabled ? "Guardian ON (+5cr)" : "Direct Return (Waived)"}</span>
+              </button>
+
               <span className="hidden sm:inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-0.5 font-mono text-[10px] font-medium text-slate-600 border border-slate-200">
                 {t("REST API Sandbox")}</span>
             </div>
@@ -938,6 +983,15 @@ console.log("TTL Status:", status);`;
                   <span className="rounded bg-teal-50 px-2 py-0.5 font-semibold text-teal-800 border border-teal-200">
                     {result.model}
                   </span>
+                  <span
+                    className={`rounded px-2 py-0.5 font-semibold border ${
+                      result.guardianEnabled !== false
+                        ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                        : "bg-amber-50 text-amber-800 border-amber-200"
+                    }`}
+                  >
+                    {result.guardianEnabled !== false ? "Guardian (+5cr)" : "Direct Return"}
+                  </span>
                 </div>
               )}
 
@@ -971,7 +1025,7 @@ console.log("TTL Status:", status);`;
                 <p className="mt-3 text-xs font-semibold text-slate-800">
                   {t("Executing")}{serviceTitle} {t("Pipeline...")}</p>
                 <p className="mt-1 font-mono text-[11px] text-slate-400">
-                  {t("Running model")}{defaultEnvModel} {t("with layout verification")}</p>
+                  {t("Running model")}: {currentModel || defaultEnvModel} {t("with layout verification")}</p>
               </div>
             )}
 

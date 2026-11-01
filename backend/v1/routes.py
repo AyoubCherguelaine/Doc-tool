@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import httpx
 from fastapi import (
@@ -38,18 +38,24 @@ from backend.billing import (
     INITIAL_TRIAL_CREDITS,
     SERVICE_PRICING,
     CompanyAccount,
-    InsufficientCreditsError,
     billing_service,
 )
 from backend.config import settings
 from backend.db import query
-from backend.documents.loader import SUPPORTED_EXTENSIONS
 from backend.documents.limits import (
-    MAX_UPLOAD_BYTES, UploadSizeError, validate_pdf_pages, validate_upload_size,
+    MAX_UPLOAD_BYTES,
+    UploadSizeError,
+    validate_pdf_pages,
+    validate_upload_size,
 )
+from backend.documents.loader import SUPPORTED_EXTENSIONS
 from backend.jobs import job_queue
+from backend.services.engine import execute_service
+from backend.services.idempotency import begin, finish, finish_error, replay_response
+from backend.services.models import DocumentRule, ServiceRequest
+from backend.services.persistence import operation_store
 from backend.storage import storage_service
-from backend.storage.ephemeral import ephemeral_store
+from backend.storage.ephemeral import EphemeralDocument, ephemeral_store
 
 logger = logging.getLogger(__name__)
 
@@ -107,34 +113,16 @@ class RawUploadPayload(BaseModel):
     filename: str = Field("document.txt", description="Filename including extension")
 
 
-class PipelineRunPayload(BaseModel):
-    document_id: Optional[str] = Field(None, description="Target document ID from POST /api/v1/documents/upload")
-    text_content: Optional[str] = Field(None, description="Direct text to process if not passing document_id")
-    service: str = Field(
-        "summary",
-        description="Service: invoice, contract, compliance, summary, form_parser, receipt, resume, research, chat",
-    )
-    query: Optional[str] = Field(None, description="Optional custom prompt or question")
-    system_prompt: Optional[str] = Field(None, description="Optional system prompt override")
-    schema_override: Optional[Any] = Field(None, description="Optional target JSON schema / structure")
-    output_format: Literal["json", "markdown", "auto"] = Field(
-        "auto", description="Desired format: structured json, markdown, or auto"
-    )
-    model: Optional[str] = Field(None, description="Optional LLM model override")
-    webhook_url: Optional[str] = Field(
-        None, description="Optional webhook URL to receive async task completion callback"
-    )
+class PipelineRunPayload(ServiceRequest):
+    """Validated service options used by all service execution paths."""
 
 
-class BatchTaskPayload(BaseModel):
-    document_id: str
-    service: str
-    query: Optional[str] = None
-    output_format: Literal["json", "markdown", "auto"] = "auto"
+class BatchTaskPayload(ServiceRequest):
+    pass
 
 
 class PipelineBatchPayload(BaseModel):
-    tasks: List[BatchTaskPayload]
+    tasks: List[BatchTaskPayload] = Field(min_length=1, max_length=100)
     webhook_url: Optional[str] = None
 
 
@@ -655,6 +643,7 @@ async def pipeline_advanced_ocr(
     start_page: int = 1
     end_page: Optional[int] = None
     language: str = "auto"
+    selected_model: Optional[str] = None
 
     if "application/json" in content_type:
         try:
@@ -692,9 +681,15 @@ async def pipeline_advanced_ocr(
                 raise HTTPException(status_code=422, detail="end_page must be an integer >= start_page")
 
         language = str(body.get("language", "auto")).lower()
+        if body.get("model"):
+            from backend.models_config import model_registry
+            selected_model = model_registry.validate_model(str(body.get("model")).strip())
 
     elif "multipart/form-data" in content_type:
         form = await request.form()
+        if form.get("model"):
+            from backend.models_config import model_registry
+            selected_model = model_registry.validate_model(str(form.get("model")).strip())
         uploaded_file = form.get("file")
         form_doc_id = form.get("document_id")
 
@@ -769,6 +764,8 @@ async def pipeline_advanced_ocr(
                 raise HTTPException(status_code=422, detail="end_page must be an integer >= start_page")
 
         language = str(form.get("language", "auto")).lower()
+        if form.get("model"):
+            selected_model = str(form.get("model")).strip()
     else:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -781,7 +778,33 @@ async def pipeline_advanced_ocr(
     if not target_path or not target_path.exists():
         raise HTTPException(status_code=422, detail="Unable to resolve document file path.")
 
+    from backend.models_config import model_registry
+    if selected_model:
+        selected_model = model_registry.validate_model(selected_model)
+    else:
+        account_id = getattr(account, "id", None) or getattr(account, "user_id", "default")
+        selected_model = COMPANY_MODEL_SETTINGS.get(str(account_id), model_registry.default_model_id)
+
+    model_obj = model_registry.get_model(selected_model) if selected_model else None
+    ocr_cost = model_obj.get("credit_cost", 5) if model_obj else 5
+    if account.remaining_credits < ocr_cost:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Insufficient credits for Advanced OCR. Required: {ocr_cost}, Remaining: {account.remaining_credits}.",
+        )
+
+    charged_credits = False
     try:
+        billing_service.check_and_deduct_credits(
+            account,
+            service_name="advanced_ocr",
+            document_id=target_doc_id,
+            request_summary=f"Advanced OCR ({selected_model}) on {target_filename}",
+            model_id=selected_model,
+            guardian=False,
+        )
+        charged_credits = True
+
         validate_upload_size(target_path.stat().st_size)
         validate_pdf_pages(target_path)
         data = await run_in_threadpool(
@@ -794,19 +817,33 @@ async def pipeline_advanced_ocr(
         return {
             **data,
             "status": "success",
+            "model": selected_model,
             "document_id": target_doc_id,
             "filename": target_filename,
+            "credits_cost": ocr_cost,
+            "credits_deducted": ocr_cost,
+            "credits_remaining": account.remaining_credits,
             "ttl_minutes": e_doc.ttl_minutes if e_doc else settings.DOC_TTL_MINUTES,
             "remaining_seconds": e_doc.remaining_seconds if e_doc else None,
             "expires_at": e_doc.expires_at.isoformat() if e_doc else None,
         }
     except UploadSizeError as exc:
+        if charged_credits:
+            billing_service.refund_credits(account, "advanced_ocr", ocr_cost, target_doc_id, "Upload size exceeded")
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except ValueError as exc:
+        if charged_credits:
+            billing_service.refund_credits(account, "advanced_ocr", ocr_cost, target_doc_id, "Invalid parameters")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OcrError as exc:
+        if charged_credits:
+            billing_service.refund_credits(account, "advanced_ocr", ocr_cost, target_doc_id, "OCR service failure")
         logger.warning("Advanced OCR failed for file %s: %s", target_filename, exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        if charged_credits:
+            billing_service.refund_credits(account, "advanced_ocr", ocr_cost, target_doc_id, "Unexpected failure")
+        raise
     finally:
         if tmp_path_to_clean and tmp_path_to_clean.exists():
             tmp_path_to_clean.unlink(missing_ok=True)
@@ -946,177 +983,31 @@ def pipeline_get_page_ocr_blocks(
         )
 
 
-@router.post("/pipeline/run", summary="Execute Pipeline Document AI Service")
+@router.post("/pipeline/run", summary="Execute a validated document service")
 async def pipeline_run_service(
     payload: PipelineRunPayload,
     response: Response,
     background_tasks: BackgroundTasks,
     account: CompanyAccount = CompanyAuth,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """
-    Execute a specialized Document AI agent in the enterprise pipeline.
-    Supports structured JSON extraction, automated billing deduction, and webhook notification.
-    """
-    service_name = payload.service.lower().replace("-", "_")
-    if service_name not in SERVICE_PRICING:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown service '{payload.service}'. Supported: {', '.join(SERVICE_PRICING.keys())}",
-        )
-
-    cost = billing_service.get_service_cost(service_name)
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-
-    # Load bundle from document_id or text_content
-    target_doc_id = payload.document_id
-    e_doc = None
-    if target_doc_id:
-        e_doc = ephemeral_store.get_and_touch(target_doc_id, extend_ttl=True)
-        try:
-            bundle = rag.get_bundle(target_doc_id)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Document '{target_doc_id}' not found: {exc}",
-            )
-    elif payload.text_content and payload.text_content.strip():
-        bundle = rag.create_text_bundle(payload.text_content.strip(), name=f"{service_name}_text.txt")
-        target_doc_id = bundle.doc_id
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Either 'document_id' or 'text_content' must be provided.",
-        )
-
-    if bundle.vector_store is None:
-        raise HTTPException(status_code=400, detail="Document index not ready.")
-
-    # Deduct credits
+    operation_key, replay = await run_in_threadpool(
+        begin, account, "pipeline", idempotency_key, payload.model_dump(mode="json")
+    )
+    if replay:
+        return replay_response(replay)
     try:
-        remaining = billing_service.check_and_deduct_credits(
-            account=account,
-            service_name=service_name,
-            document_id=target_doc_id,
-            request_summary=payload.query or f"Pipeline run: {service_name}",
-        )
-    except InsufficientCreditsError as exc:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(exc))
-
-    model = payload.model or settings.DEFAULT_MODEL
-    task_prompt = payload.query or f"Perform complete {service_name} processing and structured analysis."
-
-    effective_system_prompt = payload.system_prompt
-    if payload.schema_override:
-        schema_dump = (
-            json.dumps(payload.schema_override, indent=2, ensure_ascii=False)
-            if isinstance(payload.schema_override, (dict, list))
-            else str(payload.schema_override)
-        )
-        schema_inst = (
-            f"\n\nOUTPUT SCHEMA REQUIREMENT:\n"
-            f"You MUST format and return your final response strictly as a JSON object adhering to this schema/structure:\n"
-            f"```json\n{schema_dump}\n```\n"
-            f"Return ONLY valid JSON matching this schema."
-        )
-        if effective_system_prompt:
-            effective_system_prompt += schema_inst
-        else:
-            task_prompt += schema_inst
-
-    agent = rag._build_agent(bundle, model, mode=service_name, system_prompt=effective_system_prompt)
-
-
-    try:
-        result = await run_in_threadpool(agent.run, task_prompt)
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name=service_name,
-                credits_to_refund=cost,
-                document_id=payload.document_id,
-                reason=result.error or f"{service_name} execution failed",
-            )
-            resp_body = {
-                "status": "failed",
-                "service": service_name,
-                "documentId": payload.document_id,
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "raw": result.response or "",
-            }
-            if payload.webhook_url:
-                background_tasks.add_task(_dispatch_webhook, payload.webhook_url, resp_body)
-            response.headers["X-Credits-Cost"] = "0"
-            response.headers["X-Credits-Remaining"] = str(remaining)
-            return resp_body
-
-    except Exception as exc:
-        logger.exception("Pipeline run exception for %s: %s", service_name, exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name=service_name,
-            credits_to_refund=cost,
-            document_id=payload.document_id,
-            reason=f"Pipeline exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Execution error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    # Parse structured JSON if applicable
-    raw_text = result.response or ""
-    parsed_json = _extract_json_from_text(raw_text)
-
-    # Check steps for tool observations if not in final response
-    if parsed_json is None and hasattr(result, "steps") and result.steps:
-        for step in reversed(result.steps):
-            obs = step.get("observation", "")
-            if isinstance(obs, str) and ("{" in obs or "[" in obs):
-                step_json = _extract_json_from_text(obs)
-                if step_json:
-                    parsed_json = step_json
-                    break
-
-    # If JSON output is requested or it is a structured extraction service, guarantee structured data
-    is_structured_service = service_name in [
-        "invoice", "receipt", "contract", "compliance", "form_parser", "financial_statement", "redaction", "classifier"
-    ]
-    if (payload.output_format == "json" or is_structured_service) and parsed_json is None:
-        parsed_json = extract_structured_data(raw_text, service=service_name)
-
-    response_data: Dict[str, Any] = {
-        "status": "success",
-        "service": service_name,
-        "documentId": payload.document_id,
-        "creditsDeducted": cost,
-        "creditsRemaining": remaining,
-        "success": True,
-        "raw": raw_text,
-    }
-
-    if e_doc:
-        response_data["ttlMinutes"] = e_doc.ttl_minutes
-        response_data["remainingSeconds"] = e_doc.remaining_seconds
-        response_data["expiresAt"] = e_doc.expires_at.isoformat()
-
-    if payload.output_format == "json" or parsed_json is not None:
-        response_data["data"] = parsed_json
-
-    response.headers["X-Credits-Cost"] = str(cost)
-    response.headers["X-Credits-Remaining"] = str(remaining)
-
+        body = await run_in_threadpool(execute_service, payload, account)
+    except HTTPException as exc:
+        await run_in_threadpool(finish_error, account, operation_key, exc)
+        raise
+    # Persist before dispatching callbacks. A retry replays the result without a second charge or callback.
+    await run_in_threadpool(finish, account, operation_key, body)
+    response.headers["X-Credits-Cost"] = str(body.get("creditsDeducted", 0))
+    response.headers["X-Credits-Remaining"] = str(body["creditsRemaining"])
     if payload.webhook_url:
-        background_tasks.add_task(_dispatch_webhook, payload.webhook_url, response_data)
-
-    return response_data
+        background_tasks.add_task(_dispatch_webhook, payload.webhook_url, body)
+    return body
 
 
 @router.post("/pipeline/batch", summary="Batch Pipeline Execution")
@@ -1124,21 +1015,22 @@ async def pipeline_batch_run(
     payload: PipelineBatchPayload,
     background_tasks: BackgroundTasks,
     account: CompanyAccount = CompanyAuth,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
     """
     Execute multiple pipeline document tasks in a single batch request.
     Collects results and can trigger an asynchronous webhook when complete.
     """
+    operation_key, replay = await run_in_threadpool(
+        begin, account, "batch", idempotency_key, payload.model_dump(mode="json")
+    )
+    if replay:
+        return replay_response(replay)
     results = []
     total_cost = 0
 
     for task in payload.tasks:
-        sub_payload = PipelineRunPayload(
-            document_id=task.document_id,
-            service=task.service,
-            query=task.query,
-            output_format=task.output_format,
-        )
+        sub_payload = PipelineRunPayload.model_validate(task.model_dump())
         dummy_resp = Response()
         try:
             res = await pipeline_run_service(
@@ -1168,6 +1060,7 @@ async def pipeline_batch_run(
         "results": results,
     }
 
+    await run_in_threadpool(finish, account, operation_key, batch_summary)
     if payload.webhook_url:
         background_tasks.add_task(_dispatch_webhook, payload.webhook_url, batch_summary)
 
@@ -1179,57 +1072,88 @@ async def pipeline_batch_run(
 # ---------------------------------------------------------------------------
 
 
-class AsyncJobSubmitPayload(BaseModel):
-    document_id: str
-    service: str
-    query: Optional[str] = None
-    output_format: Literal["json", "markdown", "auto"] = "auto"
-    webhook_url: Optional[str] = None
+class AsyncJobSubmitPayload(ServiceRequest):
+    pass
 
 
-@router.post("/pipeline/jobs", status_code=status.HTTP_202_ACCEPTED, summary="Submit Async Pipeline Job")
+@router.post("/pipeline/jobs", status_code=status.HTTP_202_ACCEPTED, summary="Submit a validated service job")
 async def submit_async_pipeline_job(
     payload: AsyncJobSubmitPayload,
     account: CompanyAccount = CompanyAuth,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """
-    Submit a long-running document intelligence job to the Redis worker queue.
-    Returns immediately with HTTP 202 and a job_id for polling or webhook callback.
-    """
-    service_name = payload.service.lower().replace("-", "_")
-    if service_name not in SERVICE_PRICING:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown service '{payload.service}'. Supported: {', '.join(SERVICE_PRICING.keys())}",
-        )
-
-    cost = billing_service.get_service_cost(service_name)
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient credits for {service_name}. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-
-    job = job_queue.enqueue(
-        service=service_name,
-        document_id=payload.document_id,
-        user_id=str(account.user_id),
-        company_id=str(account.id),
-        query=payload.query,
-        output_format=payload.output_format,
-        webhook_url=payload.webhook_url,
+    service = payload.service.lower().replace("-", "_")
+    if service not in SERVICE_PRICING:
+        raise HTTPException(404, f"Unknown service '{service}'")
+    operation_key, replay = await run_in_threadpool(
+        begin, account, "job-submit", idempotency_key, payload.model_dump(mode="json")
     )
-
-    return {
+    if replay:
+        return replay_response(replay)
+    try:
+        job = await run_in_threadpool(
+            job_queue.enqueue,
+            service=service,
+            document_id=payload.document_id or "",
+            user_id=str(account.user_id),
+            company_id=str(account.id),
+            query=payload.query,
+            output_format=payload.output_format,
+            webhook_url=payload.webhook_url,
+            request_payload=payload.model_dump(mode="json"),
+        )
+    except Exception as exc:
+        error = HTTPException(503, "Job submission failed")
+        # Leave an uncertain enqueue pending: never submit the same operation twice.
+        raise error from exc
+    body = {
         "status": "accepted",
         "jobId": job.id,
         "service": job.service,
         "documentId": job.document_id,
         "state": job.status,
-        "estimatedCredits": cost,
+        "estimatedCredits": billing_service.get_service_cost(service),
         "pollUrl": f"/api/v1/pipeline/jobs/{job.id}",
         "createdAt": job.created_at,
     }
+    await run_in_threadpool(finish, account, operation_key, body, 202)
+    return body
+
+
+class RuleSetPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    rules: List[DocumentRule] = Field(min_length=1, max_length=100)
+
+
+@router.post("/rule-sets", status_code=201, summary="Create a company document rule set")
+def create_rule_set(payload: RuleSetPayload, account: CompanyAccount = CompanyAuth):
+    return operation_store.save_rules(
+        str(account.id), str(uuid.uuid4()), payload.name, [rule.model_dump() for rule in payload.rules]
+    )
+
+
+@router.get("/rule-sets", summary="List company document rule sets")
+def list_rule_sets(account: CompanyAccount = CompanyAuth):
+    return {"ruleSets": operation_store.list_rules(str(account.id))}
+
+
+@router.get("/rule-sets/{rule_id}", summary="Get a company document rule set")
+def get_rule_set(rule_id: uuid.UUID, account: CompanyAccount = CompanyAuth):
+    return operation_store.get_rules(str(account.id), str(rule_id))
+
+
+@router.put("/rule-sets/{rule_id}", summary="Update a company document rule set")
+def update_rule_set(rule_id: uuid.UUID, payload: RuleSetPayload, account: CompanyAccount = CompanyAuth):
+    operation_store.get_rules(str(account.id), str(rule_id))
+    return operation_store.save_rules(
+        str(account.id), str(rule_id), payload.name, [rule.model_dump() for rule in payload.rules]
+    )
+
+
+@router.delete("/rule-sets/{rule_id}", status_code=204, summary="Delete a company document rule set")
+def delete_rule_set(rule_id: uuid.UUID, account: CompanyAccount = CompanyAuth):
+    operation_store.delete_rules(str(account.id), str(rule_id))
+    return Response(status_code=204)
 
 
 @router.get("/pipeline/jobs/{job_id}", summary="Get Async Pipeline Job Status")
@@ -1239,7 +1163,7 @@ def get_async_pipeline_job(
 ):
     """Poll the status, progress (0-100), and result of a background job."""
     job = job_queue.get_job(job_id)
-    if not job:
+    if not job or str(job.company_id) != str(account.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
@@ -1631,27 +1555,150 @@ def get_service_pricing_catalog():
     }
 
 
+class CalculateCostPayload(BaseModel):
+    service: str
+    model: Optional[str] = None
+    guardian: bool = True
+
+
+class SetModelSettingPayload(BaseModel):
+    model: str
+
+
+class GuardianSettingPayload(BaseModel):
+    enabled: bool
+
+
+# In-memory store for company preferred model & guardian settings
+COMPANY_MODEL_SETTINGS: Dict[str, str] = {}
+COMPANY_GUARDIAN_SETTINGS: Dict[str, bool] = {}
+
+
 @router.get("/models", summary="List Available AI Models", tags=["Models"])
 def list_available_models():
-    """Retrieve available AI models for document intelligence.
-
-    Currently configured: 'gpt-6-luna' (Luna) for high-performance vision OCR,
-    structured schema generation, and bilingual Arabic/English document reasoning.
+    """Retrieve available AI models for document intelligence strictly loaded from models.json.
+    
+    Includes token rates and credit economic conversions ($2.00 USD = 1,000 Credits).
     """
-    model_name = settings.DEFAULT_MODEL or "gpt-6-luna"
+    from backend.models_config import model_registry
+
+    all_models = model_registry.get_all_models()
     return {
         "object": "list",
-        "data": [
-            {
-                "id": model_name,
-                "name": "Luna (GPT-6 Luna)",
-                "description": "High-accuracy vision, layout-aware semantic OCR, and bilingual reasoning engine.",
-                "capabilities": ["vision", "semantic_ocr", "arabic_english", "structured_json", "rag"],
-                "context_window": 128000,
-                "status": "available",
-                "is_default": True,
-            }
-        ],
-        "default_model": model_name,
-        "total_available": 1,
+        "data": all_models,
+        "default_model": model_registry.default_model_id,
+        "total_available": len(all_models),
+        "credit_price_usd": 0.002,
+        "conversion_formula": "$2.00 = 1,000 Credits ($0.002 / Credit)",
+        "allowed_models": sorted(list(model_registry.allowed_model_ids)),
+    }
+
+
+@router.post("/services/calculate-cost", summary="Calculate Credit Cost for Service and Model", tags=["Pricing"])
+def calculate_service_cost_endpoint(payload: CalculateCostPayload):
+    """Calculate the exact base service credits, model differential, guardian fee, and USD conversion."""
+    from backend.models_config import model_registry
+
+    service_name = payload.service.lower().replace("-", "_")
+    base_credits = SERVICE_PRICING.get(service_name, {}).get("credits", 10)
+    return model_registry.calculate_service_cost(base_credits, payload.model, guardian=payload.guardian)
+
+
+@router.get("/settings/model", summary="Get Current Model Setting", tags=["Settings"])
+def get_model_setting(account: CompanyAccount = CompanyAuth):
+    """Retrieve the company's active model for AI services."""
+    from backend.models_config import model_registry
+
+    chosen = COMPANY_MODEL_SETTINGS.get(str(account.id), model_registry.default_model_id)
+    model_info = model_registry.get_model(chosen) or model_registry.get_model(model_registry.default_model_id)
+    return {
+        "current_model": chosen,
+        "model_details": model_info,
+        "default_model": model_registry.default_model_id,
+        "allowed_models": sorted(list(model_registry.allowed_model_ids)),
+        "credit_price_usd": 0.002,
+        "conversion_formula": "$2.00 = 1,000 Credits ($0.002 / Credit)",
+    }
+
+
+@router.post("/settings/model", summary="Set Preferred Model for AI Services", tags=["Settings"])
+def set_model_setting(payload: SetModelSettingPayload, account: CompanyAccount = CompanyAuth):
+    """Update the company's active model for AI services. Model must exist in models.json."""
+    from backend.models_config import model_registry
+
+    valid_model = model_registry.validate_model(payload.model)
+    COMPANY_MODEL_SETTINGS[str(account.id)] = valid_model
+    model_info = model_registry.get_model(valid_model)
+    return {
+        "status": "success",
+        "current_model": valid_model,
+        "model_details": model_info,
+        "message": f"Default processing model set to {valid_model}",
+    }
+
+
+@router.get("/settings/guardian", summary="Get Current Guardian Mode Setting", tags=["Settings"])
+def get_guardian_setting(account: CompanyAccount = CompanyAuth):
+    """Retrieve the company's active Guardian mode setting."""
+    guardian_enabled = COMPANY_GUARDIAN_SETTINGS.get(str(account.id), True)
+    return {
+        "guardian": guardian_enabled,
+        "guardian_fee_credits": 5,
+        "mode": "guardian_verification" if guardian_enabled else "direct_return",
+        "description": (
+            "Guardian Verification: Grounded evidence citations, schema checks, guardrails (takes 5 credits fee)"
+            if guardian_enabled
+            else "Direct Return: Raw model extraction returned immediately without citation nullification (guardian fee waived)"
+        ),
+    }
+
+
+@router.post("/settings/guardian", summary="Set Preferred Guardian Mode", tags=["Settings"])
+def set_guardian_setting(payload: GuardianSettingPayload, account: CompanyAccount = CompanyAuth):
+    """Update the company's Guardian mode setting."""
+    COMPANY_GUARDIAN_SETTINGS[str(account.id)] = bool(payload.enabled)
+    return {
+        "status": "success",
+        "guardian": payload.enabled,
+        "mode": "guardian_verification" if payload.enabled else "direct_return",
+        "message": f"Guardian mode set to {'enabled (Full Verification)' if payload.enabled else 'disabled (Direct Return)'}",
+    }
+
+
+class UpdateWorkspacePayload(BaseModel):
+    name: str
+
+
+@router.get("/workspace", summary="Get User Dedicated Workspace", tags=["Workspace"])
+def get_workspace_info(account: CompanyAccount = CompanyAuth):
+    """Retrieve details for the current user's dedicated workspace."""
+    return {
+        "id": account.id,
+        "name": account.company_name,
+        "userId": account.user_id,
+        "planTier": account.plan_tier,
+        "totalCredits": account.total_credits,
+        "usedCredits": account.used_credits,
+        "remainingCredits": account.remaining_credits,
+        "apiKeyPrefix": account.api_key_prefix,
+        "apiKey": f"{account.api_key[:14]}••••••••••••••••••••••••{account.api_key[-4:]}",
+        "createdAt": account.created_at,
+        "status": "active" if account.is_active else "suspended",
+    }
+
+
+@router.put("/workspace", summary="Rename Workspace", tags=["Workspace"])
+def update_workspace_info(payload: UpdateWorkspacePayload, account: CompanyAccount = CompanyAuth):
+    """Rename user's dedicated workspace."""
+    clean_name = payload.name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Workspace name cannot be empty")
+    from backend.billing import billing_service
+
+    updated = billing_service.update_workspace_name(account.user_id, clean_name)
+    return {
+        "status": "success",
+        "id": updated.id,
+        "name": updated.company_name,
+        "message": f"Workspace renamed to '{updated.company_name}'",
     }

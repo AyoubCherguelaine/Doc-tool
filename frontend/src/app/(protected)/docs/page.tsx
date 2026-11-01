@@ -28,6 +28,7 @@ import {
   X,
   RefreshCw,
   Terminal,
+  Cpu,
 } from "lucide-react";
 import {
   DOCS_CATEGORIES,
@@ -42,11 +43,19 @@ import {
   generateWorkflowCode,
 } from "@/lib/docs-code-generator";
 import { fetchCompanyAccount, type CompanyAccountInfo } from "@/lib/api";
+import { useModelSettings } from "@/components/providers/model-provider";
 import { cn } from "@/lib/utils";
 
 export default function DocsPage() {
+  const { availableModels, selectedModel, setSelectedModel, calculateCost } = useModelSettings();
   const searchParams = useSearchParams();
   const router = useRouter();
+
+  const [docModel, setDocModel] = useState<string>(selectedModel);
+
+  useEffect(() => {
+    setDocModel(selectedModel);
+  }, [selectedModel]);
 
   // Active service or endpoint ID from query params
   const initialServiceId = searchParams.get("service") || "invoice";
@@ -121,10 +130,12 @@ export default function DocsPage() {
 
   const rawKey = account?.rawApiKey || account?.apiKey || account?.apiKeyPrefix || "docu_live_sample_key_9912";
 
-  const curlCode = useMemo(() => generateCurlCode(activeItem, rawKey), [activeItem, rawKey]);
-  const pythonCode = useMemo(() => generatePythonCode(activeItem, rawKey), [activeItem, rawKey]);
-  const tsCode = useMemo(() => generateTypescriptCode(activeItem, rawKey), [activeItem, rawKey]);
-  const workflowCode = useMemo(() => generateWorkflowCode(activeItem, rawKey), [activeItem, rawKey]);
+  const curlCode = useMemo(() => generateCurlCode(activeItem, rawKey, undefined, docModel), [activeItem, rawKey, docModel]);
+  const pythonCode = useMemo(() => generatePythonCode(activeItem, rawKey, undefined, docModel), [activeItem, rawKey, docModel]);
+  const tsCode = useMemo(() => generateTypescriptCode(activeItem, rawKey, undefined, docModel), [activeItem, rawKey, docModel]);
+  const workflowCode = useMemo(() => generateWorkflowCode(activeItem, rawKey, undefined, docModel), [activeItem, rawKey, docModel]);
+
+  const activeCost = useMemo(() => calculateCost(activeItem.credits, docModel), [calculateCost, activeItem.credits, docModel]);
 
   const activeCodeSnippet =
     codeLanguage === "curl"
@@ -192,7 +203,7 @@ export default function DocsPage() {
           >
             <Zap size={13} className="text-teal-600 fill-teal-600" />
             <span>
-              {account ? `${account.remainingCredits.toLocaleString()} Credits` : "1,200 Free Credits"}
+              {account ? `${account.remainingCredits.toLocaleString()} Credits` : "300 Free Credits"}
             </span>
           </Link>
 
@@ -390,6 +401,9 @@ export default function DocsPage() {
                       <Coins size={12} className="text-amber-700" /> {activeItem.credits} Credits / Call
                     </span>
                   )}
+                  <span className="inline-flex items-center gap-1 rounded-md bg-teal-50 px-2 py-0.5 text-[11px] font-mono font-bold text-teal-900 border border-teal-200">
+                    <Cpu size={12} className="text-teal-700" /> Model: {docModel}
+                  </span>
                 </div>
 
                 <h2 className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight">
@@ -630,6 +644,41 @@ export default function DocsPage() {
                 >
                   Pipeline Script
                 </button>
+              </div>
+            </div>
+
+            {/* Interactive Model Selector & Cost Estimation Bar */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/80 p-3 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-slate-700">Model:</span>
+                <select
+                  value={docModel}
+                  onChange={(e) => setDocModel(e.target.value)}
+                  className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 font-mono text-xs font-semibold text-slate-900 shadow-2xs focus:border-teal-600 focus:outline-none"
+                >
+                  {availableModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} ({m.credit_cost} credits)
+                    </option>
+                  ))}
+                </select>
+                {docModel === selectedModel ? (
+                  <span className="rounded bg-teal-100 px-2 py-0.5 text-[10px] font-bold text-teal-800">
+                    Default
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedModel(docModel)}
+                    className="text-[11px] font-semibold text-teal-700 hover:underline"
+                  >
+                    Set as Default
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-2 text-slate-600 font-mono text-[11px]">
+                <span>Cost:</span>
+                <strong className="text-slate-900">{activeCost.totalCredits} credits</strong>
               </div>
             </div>
 

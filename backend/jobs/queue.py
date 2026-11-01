@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 import redis
+from fastapi.encoders import jsonable_encoder
 
 from backend.config import settings
 
@@ -35,6 +36,7 @@ class Job:
     company_id: Optional[str] = None
     query: Optional[str] = None
     output_format: str = "auto"
+    request_payload: Optional[Dict[str, Any]] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     webhook_url: Optional[str] = None
@@ -101,6 +103,7 @@ class RedisJobQueue:
         query: Optional[str] = None,
         output_format: str = "auto",
         webhook_url: Optional[str] = None,
+        request_payload: Optional[Dict[str, Any]] = None,
     ) -> Job:
         """Enqueue an asynchronous pipeline job."""
         job_id = f"job_{uuid.uuid4().hex[:16]}"
@@ -117,6 +120,7 @@ class RedisJobQueue:
             query=query,
             output_format=output_format,
             webhook_url=webhook_url,
+            request_payload=request_payload,
             created_at=now,
             updated_at=now,
         )
@@ -125,7 +129,7 @@ class RedisJobQueue:
         if r is not None:
             try:
                 # Store job metadata
-                r.set(f"docuchat:job:{job_id}", json.dumps(job.to_dict()))
+                r.set(f"docuchat:job:{job_id}", json.dumps(jsonable_encoder(job.to_dict())))
                 # Push to default queue
                 r.rpush("docuchat:queue:default", job_id)
                 logger.info("Enqueued job %s (%s) to Redis", job_id, service)
@@ -178,11 +182,12 @@ class RedisJobQueue:
             job.error = error
         if status in ("completed", "failed", "cancelled"):
             job.completed_at = now
+            job.request_payload = None
 
         r = self._get_redis()
         if r is not None:
             try:
-                r.set(f"docuchat:job:{job_id}", json.dumps(job.to_dict()))
+                r.set(f"docuchat:job:{job_id}", json.dumps(jsonable_encoder(job.to_dict())))
                 return job
             except Exception:
                 pass
@@ -190,6 +195,37 @@ class RedisJobQueue:
         with self._lock:
             self._mem_jobs[job_id] = job
         return job
+
+    def claim_job(self, job_id: str) -> Optional[Job]:
+        """Atomically claim only queued jobs, preventing duplicate worker execution/charges."""
+        r = self._get_redis()
+        if r is not None:
+            for _ in range(5):
+                try:
+                    with r.pipeline() as pipe:
+                        key = f"docuchat:job:{job_id}"
+                        pipe.watch(key)
+                        raw = pipe.get(key)
+                        if not raw:
+                            return None
+                        job = Job(**json.loads(raw))
+                        if job.status != "queued":
+                            return None
+                        job.status, job.progress = "processing", 15
+                        job.updated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        pipe.multi()
+                        pipe.set(key, json.dumps(jsonable_encoder(job.to_dict())))
+                        pipe.execute()
+                        return job
+                except redis.WatchError:
+                    continue
+            raise RuntimeError("Could not claim job after concurrent updates")
+        with self._lock:
+            job = self._mem_jobs.get(job_id)
+            if not job or job.status != "queued":
+                return None
+            job.status, job.progress = "processing", 15
+            return job
 
     def pop_job(self, timeout_seconds: int = 1) -> Optional[str]:
         """Pop next job ID from queue for worker processing."""
@@ -276,4 +312,3 @@ class RedisJobQueue:
 
 
 job_queue = RedisJobQueue()
-

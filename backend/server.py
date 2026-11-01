@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 import tempfile
-import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from threading import Event
 from typing import Annotated, Any, Literal, Optional
 
 from fastapi import (
@@ -21,6 +22,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -30,17 +32,19 @@ from backend.billing import (
     INITIAL_TRIAL_CREDITS,
     SERVICE_PRICING,
     CompanyAccount,
-    InsufficientCreditsError,
     billing_service,
 )
-from backend.documents.loader import SUPPORTED_EXTENSIONS
 from backend.documents.limits import MAX_DOCUMENT_PAGES, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB
+from backend.documents.loader import SUPPORTED_EXTENSIONS
 from backend.jobs import job_queue, start_background_worker
 from backend.mcp.server import mcp_server
+from backend.services.models import ServiceOptions, ServiceRequest
 from backend.storage import storage_service
 from backend.v1.routes import (
     _extract_json_from_text,
     extract_structured_data,
+)
+from backend.v1.routes import (
     router as v1_router,
 )
 
@@ -55,12 +59,35 @@ from .auth import (
 from .config import settings
 from .db import execute, query
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.info("Starting DOCTool background job queue worker...")
-    start_background_worker()
-    yield
+    stop_worker = Event()
+    worker = start_background_worker(stop_check=stop_worker.is_set)
+
+    async def purge_service_results():
+        from backend.services.persistence import operation_store
+
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await asyncio.to_thread(operation_store.purge_expired_results)
+            except Exception:
+                logging.warning("Could not purge expired service operation results")
+
+    cleanup = asyncio.create_task(purge_service_results())
+    try:
+        yield
+    finally:
+        stop_worker.set()
+        await asyncio.to_thread(worker.join, 0.5)
+        cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup
+
 
 app = FastAPI(title="DOCTool API", version="0.1.0", lifespan=lifespan)
 
@@ -386,13 +413,31 @@ def delete_session(session_id: str, user: CurrentUser):
 class ChatPayload(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     mode: Literal[
-        "conversational", "agent", "summary", "research", "extraction",
-        "comparison", "factcheck", "coordinator", "invoice", "contract",
-        "google_ai", "receipt", "resume", "compliance", "form_parser",
-        "redaction", "classifier", "financial_statement", "translation", "anomaly_audit"
+        "conversational",
+        "agent",
+        "summary",
+        "research",
+        "extraction",
+        "comparison",
+        "factcheck",
+        "coordinator",
+        "invoice",
+        "contract",
+        "google_ai",
+        "receipt",
+        "resume",
+        "compliance",
+        "form_parser",
+        "redaction",
+        "classifier",
+        "financial_statement",
+        "translation",
+        "anomaly_audit",
     ] = "conversational"
     model: str | None = None
     responseStyle: Literal["concise", "balanced", "detailed"] = "balanced"
+
+    options: ServiceOptions = Field(default_factory=ServiceOptions)
 
 
 def _row_to_msg(r):
@@ -406,84 +451,119 @@ def _row_to_msg(r):
 
 
 @app.post("/api/sessions/{session_id}/chat")
-def chat(session_id: str, payload: ChatPayload, user: CurrentUser):
-    s = query(
+def chat(
+    session_id: str,
+    payload: ChatPayload,
+    user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
+):
+    from backend.billing import InsufficientCreditsError
+    from backend.services.idempotency import begin, finish, finish_error, replay_response
+
+    session = query(
         "SELECT document_id FROM docuchat.sessions WHERE id = %s AND user_id = %s",
         (session_id, str(user["id"])),
         one=True,
     )
-    if not s:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-    doc_id = str(s["document_id"])
+    if not session:
+        raise HTTPException(404, "Session not found")
+    doc_id = str(session["document_id"])
+    from backend.models_config import model_registry
 
-    model = payload.model or settings.DEFAULT_MODEL
-    if model not in settings.CHAT_MODELS:
+    try:
+        model = model_registry.validate_model(payload.model) if payload.model else (settings.DEFAULT_MODEL or model_registry.default_model_id)
+    except HTTPException:
+        raise HTTPException(422, "Model is not enabled on this server.")
+    if model not in settings.CHAT_MODELS and model not in model_registry.allowed_model_ids:
         raise HTTPException(422, "Model is not enabled on this server.")
     if not payload.message.strip():
         raise HTTPException(422, "Message cannot be blank.")
-
-    # Deduct credits from user's company account
     account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    mode_to_service = {"conversational": "chat", "agent": "research"}
-    service_name = mode_to_service.get(payload.mode, payload.mode)
-    cost = billing_service.get_service_cost(service_name)
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Company Free Trial credits depleted. Required: {cost}, Remaining: {account.remaining_credits} credits.",
+    operation_key, replay = begin(
+        account, "chat", idempotency_key, {"session_id": session_id, **payload.model_dump(mode="json")}
+    )
+    if replay:
+        if replay["status_code"] != 200:
+            return replay_response(replay)
+        return Response(
+            replay["body"]["text"], media_type="text/plain; charset=utf-8", headers={"X-Idempotency-Replayed": "true"}
         )
-    billing_service.check_and_deduct_credits(
-        account,
-        service_name,
-        document_id=doc_id,
-        request_summary=payload.message[:80],
-    )
-
-    history = rag.get_history(session_id)
-    # Persist the user question after reading history to avoid duplicate turns.
-    execute(
-        "INSERT INTO docuchat.messages (id, session_id, role, content) VALUES (%s, %s, %s, %s)",
-        (str(uuid.uuid4()), session_id, "user", payload.message),
-    )
-    execute(
-        "UPDATE docuchat.sessions SET updated_at = now() WHERE id = %s",
-        (session_id,),
-    )
-    gen = rag.stream_chat(
-        doc_id=doc_id,
-        query=payload.message,
-        history=history,
-        model_name=model,
-        mode=payload.mode,
-        response_style=payload.responseStyle,
-    )
+    service = {"conversational": "chat", "agent": "research"}.get(payload.mode, payload.mode)
+    cost = billing_service.get_service_cost(service, model_id=model)
+    charged = False
+    try:
+        if account.remaining_credits < cost:
+            message = "Company credits depleted." if account.remaining_credits == 0 else "Insufficient credits."
+            raise HTTPException(402, f"{message} Required: {cost}, Remaining: {account.remaining_credits}.")
+        billing_service.check_and_deduct_credits(
+            account, service, document_id=doc_id, request_summary=payload.message[:80], model_id=model
+        )
+        charged = True
+        history = rag.get_history(session_id)
+        execute(
+            "INSERT INTO docuchat.messages (id, session_id, role, content) VALUES (%s, %s, %s, %s)",
+            (str(uuid.uuid4()), session_id, "user", payload.message),
+        )
+        execute("UPDATE docuchat.sessions SET updated_at = now() WHERE id = %s", (session_id,))
+        gen = rag.stream_chat(
+            doc_id=doc_id,
+            query=payload.message,
+            history=history,
+            model_name=model,
+            mode=payload.mode,
+            response_style=payload.responseStyle,
+            service_options=payload.options,
+        )
+    except Exception as exc:
+        if charged:
+            billing_service.refund_credits(account, service, cost, doc_id, "Chat preparation failed")
+        error = (
+            exc
+            if isinstance(exc, HTTPException)
+            else HTTPException(402, str(exc))
+            if isinstance(exc, InsufficientCreditsError)
+            else HTTPException(503, "Chat could not be prepared")
+        )
+        finish_error(account, operation_key, error)
+        raise error from exc
 
     def _event_stream():
         accumulated = io.StringIO()
+        completed, refunded = False, False
         try:
             for chunk in gen:
                 accumulated.write(chunk)
                 yield chunk
-        except Exception:  # noqa: BLE001
+            if not accumulated.getvalue().strip():
+                raise RuntimeError("Empty chat response")
+            completed = True
+        except Exception:
             logging.exception("Chat stream failed")
-            if not accumulated.getvalue():
-                try:
-                    billing_service.refund_credits(
-                        account=account,
-                        service_name=service_name,
-                        credits_to_refund=cost,
-                        document_id=doc_id,
-                        reason="Chat stream failed before emitting content",
-                    )
-                except Exception:
-                    pass
-            yield "\n\n[STREAM ERROR] The model could not complete this response. If credits were deducted, they have been automatically refunded. Please try again."
+            billing_service.refund_credits(account, service, cost, doc_id, "Chat stream failed")
+            refunded = True
+            error_text = "\n\n[STREAM ERROR] The response could not be completed. Credits were refunded."
+            accumulated.write(error_text)
+            yield error_text
         finally:
-            # Persist the assistant turn once streaming is complete.
+            if not completed and not refunded:
+                billing_service.refund_credits(account, service, cost, doc_id, "Chat stream interrupted")
+                accumulated.write("\n\n[STREAM INTERRUPTED] The response was interrupted. Credits were refunded.")
             text = accumulated.getvalue()
-            execute(
-                "INSERT INTO docuchat.messages (id, session_id, role, content) VALUES (%s, %s, %s, %s)",
-                (str(uuid.uuid4()), session_id, "assistant", text or "[no response]"),
+            try:
+                execute(
+                    "INSERT INTO docuchat.messages (id, session_id, role, content) VALUES (%s, %s, %s, %s)",
+                    (str(uuid.uuid4()), session_id, "assistant", text or "[no response]"),
+                )
+            except Exception:
+                logging.exception("Could not persist the assistant turn")
+            close = getattr(gen, "close", None)
+            if callable(close):
+                with suppress(Exception):
+                    close()
+            finish(
+                account,
+                operation_key,
+                {"text": text, "success": completed, "creditsDeducted": cost if completed else 0},
             )
 
     return StreamingResponse(_event_stream(), media_type="text/plain; charset=utf-8")
@@ -533,12 +613,17 @@ def get_services_status():
 
 @app.get("/api/capabilities")
 def capabilities(user: CurrentUser):
+    from backend.models_config import model_registry
+
+    all_ids = sorted(list(model_registry.allowed_model_ids))
     return {
-        "models": settings.CHAT_MODELS,
-        "defaultModel": settings.DEFAULT_MODEL,
+        "models": all_ids,
+        "defaultModel": model_registry.default_model_id,
         "formats": sorted(SUPPORTED_EXTENSIONS),
         "maxUploadMB": MAX_UPLOAD_MB,
         "maxPages": MAX_DOCUMENT_PAGES,
+        "creditPriceUsd": 0.002,
+        "conversionFormula": "$2.00 = 1,000 Credits ($0.002 / Credit)",
     }
 
 
@@ -789,85 +874,16 @@ def run_workflow(
     doc_id: str,
     payload: WorkflowPayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Run a predefined workflow on a document — returns the full result."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "coordinator",
+        doc_id,
+        "Summarize this document, extract key data and review supported claims.",
+        user,
+        model=payload.model,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    model = payload.model or settings.DEFAULT_MODEL
-    if model not in settings.CHAT_MODELS:
-        raise HTTPException(422, "Model is not enabled on this server.")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    # Deduct company credits
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("coordinator")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "coordinator", document_id=doc_id, request_summary="Multi-agent workflow"
-    )
-
-    # Build a coordinator that routes to specialists
-    coordinator = rag._build_agent(bundle, model, mode="coordinator")
-
-    try:
-        result = coordinator.run("Analyse this document comprehensively. Produce an executive summary, identify key data and metrics, highlight any comparisons or contradictions, and verify any claims you can find. Use all specialist agents as needed.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="coordinator",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Workflow execution did not complete successfully",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "title": doc["original_filename"],
-                "result": result.response or "Workflow execution degraded or stopped.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Workflow failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="coordinator",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Workflow exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Workflow service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return {
-        "documentId": str(doc["id"]),
-        "title": doc["original_filename"],
-        "result": result.response or "",
-        "creditsDeducted": cost,
-        "creditsRemaining": remaining,
-        "success": result.success,
-        "iterations": result.iterations,
-        "steps": result.steps,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -885,85 +901,16 @@ def analyze_with_google_ai(
     doc_id: str,
     payload: GoogleAIPayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Analyze a document using Google AI Document Intelligence."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "google_ai",
+        doc_id,
+        f"Process this document for the requested task: {payload.task}.",
+        user,
+        model=payload.model,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    # Deduct company credits
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("google_ai")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "google_ai", document_id=doc_id, request_summary=f"Google AI {payload.task} analysis"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="google_ai")
-
-    try:
-        result = agent.run(
-            f"Perform a {payload.task} analysis on '{doc['original_filename']}' using Google AI document intelligence. Extract layout, entities, tables, and summarize."
-        )
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="google_ai",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Google AI analysis did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "task": payload.task,
-                "result": result.response or "Google AI service degraded or stopped.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Google AI analysis failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="google_ai",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Google AI exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Google AI service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return {
-        "documentId": str(doc["id"]),
-        "filename": doc["original_filename"],
-        "task": payload.task,
-        "result": result.response or "",
-        "creditsDeducted": cost,
-        "creditsRemaining": remaining,
-        "success": result.success,
-        "iterations": result.iterations,
-        "steps": result.steps,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +920,11 @@ def analyze_with_google_ai(
 
 class DocumentAIServicePayload(BaseModel):
     model: str | None = None
+    query: str | None = None
+    schema_override: dict | None = None
+    output_format: Literal["json", "markdown", "auto"] = "auto"
+    guardian: bool = True
+    options: ServiceOptions = Field(default_factory=ServiceOptions)
 
 
 def _format_service_result(
@@ -1039,71 +991,19 @@ def analyze_receipt(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Extract receipt, expense, and transaction intelligence as structured JSON."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "receipt",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("receipt")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "receipt", document_id=doc_id, request_summary="Receipt & expense extraction"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="receipt")
-    try:
-        result = agent.run(f"Extract all receipt and expense data from '{doc['original_filename']}'.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="receipt",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Receipt analysis did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "receipt",
-                "result": result.response or "Receipt service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Receipt analysis failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="receipt",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Receipt exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Receipt service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, "receipt", result, bundle, cost, remaining)
 
 
 @app.post("/api/documents/{doc_id}/resume")
@@ -1111,71 +1011,19 @@ def analyze_resume(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Extract talent, skills, experience, and qualification profile from resumes/CVs."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "resume",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("resume")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "resume", document_id=doc_id, request_summary="Resume & talent profiling"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="resume")
-    try:
-        result = agent.run(f"Extract candidate profile, skills taxonomy, and work history from '{doc['original_filename']}'.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="resume",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Resume analysis did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "resume",
-                "result": result.response or "Resume service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Resume analysis failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="resume",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Resume exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Resume service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, "resume", result, bundle, cost, remaining)
 
 
 @app.post("/api/documents/{doc_id}/compliance")
@@ -1183,71 +1031,19 @@ def audit_compliance(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Audit document for PII, GDPR/HIPAA compliance risks, and provide redaction advice."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "compliance",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("compliance")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "compliance", document_id=doc_id, request_summary="PII & compliance audit"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="compliance")
-    try:
-        result = agent.run(f"Audit '{doc['original_filename']}' for PII exposure, data privacy risks, and regulatory compliance.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="compliance",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Compliance audit did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "compliance",
-                "result": result.response or "Compliance service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Compliance audit failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="compliance",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Compliance exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Compliance service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, "compliance", result, bundle, cost, remaining)
 
 
 @app.post("/api/documents/{doc_id}/form-parser")
@@ -1255,71 +1051,19 @@ def parse_form_fields(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Extract key-value fields, checkboxes, and signatures from structured forms."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "form_parser",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("form_parser")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "form_parser", document_id=doc_id, request_summary="Form fields extraction"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="form_parser")
-    try:
-        result = agent.run(f"Parse all form fields, checkboxes, and signatures from '{doc['original_filename']}'.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="form_parser",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Form parser did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "form_parser",
-                "result": result.response or "Form parser service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Form parser failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="form_parser",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Form parser exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Form parser service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, "form_parser", result, bundle, cost, remaining)
 
 
 @app.post("/api/documents/{doc_id}/comparison")
@@ -1327,81 +1071,19 @@ def analyze_comparison(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Compare content, clauses, and perspectives within and across documents."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "comparison",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("comparison")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "comparison", document_id=doc_id, request_summary="Document comparison"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="comparison")
-    try:
-        result = agent.run(f"Perform a comprehensive comparative analysis of key provisions and topics in '{doc['original_filename']}'.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="comparison",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Comparison did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "comparison",
-                "result": result.response or "Comparison service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Comparison analysis failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="comparison",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Comparison exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Comparison service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return {
-        "documentId": str(doc["id"]),
-        "filename": doc["original_filename"],
-        "service": "comparison",
-        "result": result.response or "",
-        "creditsDeducted": cost,
-        "creditsRemaining": remaining,
-        "success": result.success,
-        "iterations": result.iterations,
-        "steps": result.steps,
-    }
 
 
 @app.post("/api/documents/{doc_id}/factcheck")
@@ -1409,81 +1091,19 @@ def analyze_factcheck(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Verify factual claims against document evidence and score validity."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "factcheck",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("factcheck")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "factcheck", document_id=doc_id, request_summary="Fact-check verification"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="factcheck")
-    try:
-        result = agent.run(f"Identify and verify all factual claims, metrics, and dates in '{doc['original_filename']}'.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="factcheck",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Fact check did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "factcheck",
-                "result": result.response or "Fact-check service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Fact-check failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="factcheck",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Fact-check exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Fact-check service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return {
-        "documentId": str(doc["id"]),
-        "filename": doc["original_filename"],
-        "service": "factcheck",
-        "result": result.response or "",
-        "creditsDeducted": cost,
-        "creditsRemaining": remaining,
-        "success": result.success,
-        "iterations": result.iterations,
-        "steps": result.steps,
-    }
 
 
 @app.post("/api/documents/{doc_id}/invoice")
@@ -1491,75 +1111,19 @@ def analyze_invoice(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Extract invoice line items, tax, due date, and payment details."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "invoice",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("invoice")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "invoice", document_id=doc_id, request_summary="Invoice extraction"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="invoice")
-    try:
-        result = agent.run(
-            f"Extract all invoice details, line items, taxes, vendor, and totals from '{doc['original_filename']}'. "
-            "Return your final answer as clean, structured JSON only."
-        )
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="invoice",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Invoice extraction did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "invoice",
-                "result": result.response or "Invoice service degraded or encountered errors.",
-                "data": None,
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Invoice analysis failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="invoice",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Invoice exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Invoice service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, "invoice", result, bundle, cost, remaining)
 
 
 @app.post("/api/documents/{doc_id}/contract")
@@ -1567,71 +1131,19 @@ def analyze_contract(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Analyze contract terms, liabilities, indemnities, and termination clauses."""
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
-        (doc_id, str(user["id"])),
-        one=True,
+    return _execute_specialized_service(
+        "contract",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
+        model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost("contract")
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, "contract", document_id=doc_id, request_summary="Contract analysis"
-    )
-
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode="contract")
-    try:
-        result = agent.run(f"Analyze key clauses, termination, liabilities, and obligations in '{doc['original_filename']}'.")
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name="contract",
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or "Contract analysis did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": "contract",
-                "result": result.response or "Contract service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Contract analysis failed: %s", exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name="contract",
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Contract exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Contract service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, "contract", result, bundle, cost, remaining)
 
 
 def _execute_specialized_service(
@@ -1640,70 +1152,54 @@ def _execute_specialized_service(
     default_prompt: str,
     user: CurrentUser,
     model: str | None = None,
+    options: ServiceOptions | None = None,
+    schema_override: dict | None = None,
+    output_format: str = "auto",
+    idempotency_key: str | None = None,
+    guardian: bool = True,
 ):
+    """Compatibility routes share the executor, output validation and replay protection."""
+    from backend.services.engine import execute_service
+    from backend.services.idempotency import begin, finish, finish_error, replay_response
+
+    try:
+        request = ServiceRequest(
+            service=service_name,
+            document_id=doc_id,
+            model=model,
+            guardian=guardian,
+            query=default_prompt.format(filename="the selected document"),
+            options=options or ServiceOptions(),
+            schema_override=schema_override,
+            output_format=output_format,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    account = billing_service.get_or_create_company(user["id"], user.get("name"))
+    operation_key, replay = begin(
+        account, f"document-service:{service_name}", idempotency_key, request.model_dump(mode="json")
+    )
+    if replay:
+        return replay_response(replay)
+    try:
+        body = execute_service(request, account)
+    except HTTPException as exc:
+        finish_error(account, operation_key, exc)
+        raise
     doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s AND user_id = %s",
+        "SELECT original_filename FROM docuchat.documents WHERE id=%s AND user_id=%s",
         (doc_id, str(user["id"])),
         one=True,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(doc_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload the document.")
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost(service_name)
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-    remaining = billing_service.check_and_deduct_credits(
-        account, service_name, document_id=doc_id, request_summary=f"Run {service_name}"
+    data = body.get("data")
+    body.update(
+        filename=doc["original_filename"] if doc else "document",
+        result=json.dumps(jsonable_encoder(data), ensure_ascii=False, indent=2)
+        if data is not None
+        else body.get("raw", ""),
     )
-
-    selected_model = model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, selected_model, mode=service_name)
-    try:
-        result = agent.run(default_prompt.format(filename=doc["original_filename"]))
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name=service_name,
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or f"{service_name} did not succeed",
-            )
-            return {
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "service": service_name,
-                "result": result.response or f"{service_name} service degraded or encountered errors.",
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("%s failed: %s", service_name, exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name=service_name,
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"{service_name} exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{service_name} service error: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    return _format_service_result(doc, service_name, result, bundle, cost, remaining)
+    finish(account, operation_key, body)
+    return body
 
 
 @app.post("/api/documents/{doc_id}/redaction")
@@ -1711,14 +1207,18 @@ def redact_sensitive_pii(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Bilingual PII and tax data redaction (Saudi National ID, GCC IBAN, ZATCA Tax ID, CR, contacts)."""
     return _execute_specialized_service(
-        service_name="redaction",
-        doc_id=doc_id,
-        default_prompt="Redact all sensitive PII, Saudi IDs, GCC IBANs, and ZATCA tax numbers from '{filename}'.",
-        user=user,
+        "redaction",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
         model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1727,14 +1227,18 @@ def classify_document_endpoint(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Classify document type, language (AR/EN), urgency, and routing department."""
     return _execute_specialized_service(
-        service_name="classifier",
-        doc_id=doc_id,
-        default_prompt="Classify document '{filename}' and identify language, type, urgency, and routing.",
-        user=user,
+        "classifier",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
         model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1743,14 +1247,18 @@ def analyze_financial_statement_endpoint(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Analyze financial statements, balance sheet, income statement, and financial ratios."""
     return _execute_specialized_service(
-        service_name="financial_statement",
-        doc_id=doc_id,
-        default_prompt="Extract and analyze financial metrics, ratios, and solvency indicators from '{filename}'.",
-        user=user,
+        "financial_statement",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
         model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1759,14 +1267,18 @@ def translate_document_endpoint(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """High-fidelity bilingual translation between Arabic and English."""
     return _execute_specialized_service(
-        service_name="translation",
-        doc_id=doc_id,
-        default_prompt="Translate document '{filename}' with high terminology fidelity between Arabic and English.",
-        user=user,
+        "translation",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
         model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1775,14 +1287,18 @@ def audit_anomalies_endpoint(
     doc_id: str,
     payload: DocumentAIServicePayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Audit invoice calculations, ZATCA 15% VAT, and chronological date integrity."""
     return _execute_specialized_service(
-        service_name="anomaly_audit",
-        doc_id=doc_id,
-        default_prompt="Perform mathematical anomaly and ZATCA 15% tax compliance audit on '{filename}'.",
-        user=user,
+        "anomaly_audit",
+        doc_id,
+        payload.query or "Process the selected document.",
+        user,
         model=payload.model,
+        options=payload.options,
+        schema_override=payload.schema_override,
+        output_format=payload.output_format,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1854,6 +1370,52 @@ def get_company_status(
     }
 
 
+class UpdateWorkspacePayload(BaseModel):
+    name: str
+
+
+@app.get("/api/workspace")
+def get_user_workspace(
+    user: CurrentUser,
+    account: CompanyAccount = Depends(get_company_account),
+):
+    """Retrieve user's dedicated workspace details."""
+    return {
+        "id": account.id,
+        "name": account.company_name,
+        "userId": str(user["id"]),
+        "userName": user.get("name"),
+        "userEmail": user.get("email"),
+        "planTier": account.plan_tier,
+        "totalCredits": account.total_credits,
+        "usedCredits": account.used_credits,
+        "remainingCredits": account.remaining_credits,
+        "apiKeyPrefix": account.api_key_prefix,
+        "apiKey": f"{account.api_key[:14]}••••••••••••••••••••••••{account.api_key[-4:]}",
+        "rawApiKey": account.api_key,
+        "createdAt": account.created_at,
+        "status": "active" if account.is_active else "suspended",
+    }
+
+
+@app.put("/api/workspace")
+def update_user_workspace(
+    payload: UpdateWorkspacePayload,
+    user: CurrentUser,
+):
+    """Update user's dedicated workspace name."""
+    clean_name = payload.name.strip()
+    if not clean_name:
+        raise HTTPException(400, "Workspace name cannot be empty")
+    account = billing_service.update_workspace_name(str(user["id"]), clean_name)
+    return {
+        "status": "success",
+        "id": account.id,
+        "name": account.company_name,
+        "message": f"Workspace renamed to '{account.company_name}'",
+    }
+
+
 @app.post("/api/company/api-key/regenerate")
 def roll_api_key(
     user: CurrentUser,
@@ -1909,10 +1471,8 @@ def get_company_usage_history(
 # ---------------------------------------------------------------------------
 
 
-class CompanyExecutionPayload(BaseModel):
-    document_id: str
-    query: str | None = None
-    model: str | None = None
+class CompanyExecutionPayload(ServiceRequest):
+    pass
 
 
 @app.post("/api/v1/services/{service_name}")
@@ -1921,131 +1481,47 @@ def execute_company_service(
     payload: CompanyExecutionPayload,
     response: Response,
     account: CompanyAuth,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """Execute a Document AI service using company API key with atomic credit deduction."""
-    normalized_service = service_name.lower().replace("-", "_")
+    from backend.services.engine import execute_service
+    from backend.services.idempotency import begin, finish, finish_error, replay_response
 
-    if normalized_service not in SERVICE_PRICING:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown service '{service_name}'. Valid services: {', '.join(SERVICE_PRICING.keys())}",
-        )
-
-    cost = billing_service.get_service_cost(normalized_service)
-
-    # 1. Verify credit balance before execution
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=(
-                f"Insufficient credits for '{normalized_service}'. Required: {cost}, "
-                f"Remaining: {account.remaining_credits}. Company Free Trial credits depleted."
-            ),
-        )
-
-    # 2. Check document
-    doc = query(
-        "SELECT id, original_filename, page_count FROM docuchat.documents WHERE id = %s",
-        (payload.document_id,),
-        one=True,
+    try:
+        request = ServiceRequest.model_validate({**payload.model_dump(), "service": service_name})
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    operation_key, replay = begin(account, "company-service", idempotency_key, request.model_dump(mode="json"))
+    if replay:
+        return replay_response(replay)
+    try:
+        body = execute_service(request, account)
+    except HTTPException as exc:
+        finish_error(account, operation_key, exc)
+        raise
+    body.update(
+        result=json.dumps(jsonable_encoder(body["data"]), ensure_ascii=False, indent=2)
+        if body.get("data") is not None
+        else body.get("raw", ""),
+        planTier=account.plan_tier,
     )
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    bundle = rag.get_bundle(payload.document_id)
-    if bundle.vector_store is None:
-        raise HTTPException(500, "Document index not available. Re-upload or process the document.")
-
-    # 3. Deduct credits atomically
-    try:
-        remaining = billing_service.check_and_deduct_credits(
-            account=account,
-            service_name=normalized_service,
-            document_id=payload.document_id,
-            request_summary=payload.query or f"API execution of {normalized_service}",
-        )
-    except InsufficientCreditsError as exc:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(exc))
-
-    # 4. Execute the Document AI Agent with fault tolerance and automatic refund on down/error
-    model = payload.model or settings.DEFAULT_MODEL
-    agent = rag._build_agent(bundle, model, mode=normalized_service)
-
-    task_prompt = payload.query or f"Perform full {normalized_service} intelligence extraction on '{doc['original_filename']}'."
-
-    try:
-        result = agent.run(task_prompt)
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name=normalized_service,
-                credits_to_refund=cost,
-                document_id=payload.document_id,
-                reason=result.error or f"{normalized_service} execution did not complete successfully",
-            )
-            response.headers["X-Credits-Cost"] = "0"
-            response.headers["X-Credits-Remaining"] = str(remaining)
-            response.headers["X-Credits-Refunded"] = str(cost)
-            response.headers["X-Trial-Plan"] = "free_trial"
-            return {
-                "status": "failed",
-                "service": normalized_service,
-                "documentId": str(doc["id"]),
-                "filename": doc["original_filename"],
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "planTier": account.plan_tier,
-                "result": result.response or "The service encountered an error and could not complete.",
-                "success": False,
-                "error": result.error,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-    except Exception as exc:
-        logging.exception("Agent execution exception in %s: %s", normalized_service, exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name=normalized_service,
-            credits_to_refund=cost,
-            document_id=payload.document_id,
-            reason=f"Service exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Service '{normalized_service}' failed: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
-    # Set response headers
-    response.headers["X-Credits-Cost"] = str(cost)
-    response.headers["X-Credits-Remaining"] = str(remaining)
-    response.headers["X-Trial-Plan"] = "free_trial"
-
-    return {
-        "status": "success",
-        "service": normalized_service,
-        "documentId": str(doc["id"]),
-        "filename": doc["original_filename"],
-        "creditsDeducted": cost,
-        "creditsRemaining": remaining,
-        "planTier": account.plan_tier,
-        "result": result.response or "",
-        "success": result.success,
-        "iterations": result.iterations,
-        "steps": result.steps,
-    }
+    finish(account, operation_key, body)
+    response.headers["X-Credits-Cost"] = str(body.get("creditsDeducted", 0))
+    response.headers["X-Credits-Remaining"] = str(body["creditsRemaining"])
+    return body
 
 
 class PlaygroundRunPayload(BaseModel):
-    service: str = Field(..., description="Target service: invoice, contract, receipt, etc.")
-    document_id: Optional[str] = Field(None, description="Existing document ID from drive/workspace")
-    text_content: Optional[str] = Field(None, description="Raw text or sample document text for testing")
-    system_prompt: Optional[str] = Field(None, description="Custom system prompt override")
-    user_prompt: Optional[str] = Field(None, description="Custom task / user query prompt")
-    schema_override: Optional[Any] = Field(None, description="Target JSON schema or template structure")
-    model: Optional[str] = Field(None, description="Model override (e.g. gpt-4o, gpt-4o-mini)")
-    temperature: Optional[float] = Field(None, ge=0.0, le=2.0, description="Sampling temperature")
-    output_format: Literal["json", "markdown", "auto"] = Field("auto", description="Desired output format")
+    service: str
+    document_id: Optional[str] = None
+    text_content: Optional[str] = None
+    system_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None
+    schema_override: Optional[dict] = None
+    model: Optional[str] = None
+    temperature: Optional[float] = Field(None, ge=0, le=2)
+    output_format: Literal["json", "markdown", "auto"] = "auto"
+    guardian: bool = True
+    options: ServiceOptions = Field(default_factory=ServiceOptions)
 
 
 PlaygroundRunPayload.model_rebuild()
@@ -2055,216 +1531,197 @@ PlaygroundRunPayload.model_rebuild()
 def get_playground_presets(user: CurrentUser):
     """Retrieve service presets, default prompts, schemas, and sample contexts for the playground."""
     from backend.agent.playground_presets import SERVICE_PRESETS
-    model_list = list(dict.fromkeys(
-        ([settings.DEFAULT_MODEL] if settings.DEFAULT_MODEL else []) +
-        (settings.CHAT_MODELS if settings.CHAT_MODELS else [])
-    ))
-    if not model_list:
-        model_list = [settings.DEFAULT_MODEL]
-    models = [{"id": m, "name": m, "description": f"Model configured in .env ({m})"} for m in model_list]
+    from backend.models_config import model_registry
+
+    all_models = model_registry.get_all_models()
+    models = [
+        {
+            "id": m["id"],
+            "name": m["name"],
+            "description": m["description"],
+            "creditCost": m["credit_cost"],
+            "costUsd": m["cost_usd"],
+            "costUsdFormatted": m["cost_usd_formatted"],
+            "speedTier": m["speed_tier"],
+            "reasoningTier": m["reasoning_tier"],
+            "pricing": m["pricing"],
+            "tokenCredits": m["token_credits"],
+        }
+        for m in all_models
+    ]
     # Sanitize presets to hide internal system prompts from clients
     sanitized_presets = {}
     for key, data in SERVICE_PRESETS.items():
         preset_copy = dict(data)
         preset_copy.pop("default_system_prompt", None)
+        from backend.services.contracts import service_schema
+
+        if service_schema(key):
+            preset_copy["default_schema"] = service_schema(key)
         sanitized_presets[key] = preset_copy
     return {
         "presets": sanitized_presets,
         "models": models,
-        "defaultModel": settings.DEFAULT_MODEL,
+        "defaultModel": model_registry.default_model_id,
+        "creditPriceUsd": 0.002,
+        "conversionFormula": "$2.00 = 1,000 Credits ($0.002 / Credit)",
     }
+
+
+@app.get("/api/models")
+def get_api_models():
+    """List allowed models strictly from models.json with pricing and credit rates."""
+    from backend.models_config import model_registry
+
+    return {
+        "object": "list",
+        "data": model_registry.get_all_models(),
+        "default_model": model_registry.default_model_id,
+        "total_available": len(model_registry.allowed_model_ids),
+        "credit_price_usd": 0.002,
+        "conversion_formula": "$2.00 = 1,000 Credits ($0.002 / Credit)",
+        "allowed_models": sorted(list(model_registry.allowed_model_ids)),
+    }
+
+
+class ModelSettingPayload(BaseModel):
+    model: str
+
+
+@app.get("/api/settings/model")
+def get_user_model_setting(user: CurrentUser):
+    """Retrieve current user/company chosen model for AI services."""
+    from backend.models_config import model_registry
+    from backend.v1.routes import COMPANY_MODEL_SETTINGS
+
+    chosen = COMPANY_MODEL_SETTINGS.get(str(user["id"]), model_registry.default_model_id)
+    return {
+        "currentModel": chosen,
+        "modelDetails": model_registry.get_model(chosen) or model_registry.get_model(model_registry.default_model_id),
+        "defaultModel": model_registry.default_model_id,
+        "allowedModels": sorted(list(model_registry.allowed_model_ids)),
+        "creditPriceUsd": 0.002,
+        "conversionFormula": "$2.00 = 1,000 Credits ($0.002 / Credit)",
+    }
+
+
+@app.post("/api/settings/model")
+def set_user_model_setting(payload: ModelSettingPayload, user: CurrentUser):
+    """Set chosen model for AI services. Rejects any model not in models.json."""
+    from backend.models_config import model_registry
+    from backend.v1.routes import COMPANY_MODEL_SETTINGS
+
+    valid_model = model_registry.validate_model(payload.model)
+    COMPANY_MODEL_SETTINGS[str(user["id"])] = valid_model
+    return {
+        "status": "success",
+        "currentModel": valid_model,
+        "modelDetails": model_registry.get_model(valid_model),
+        "message": f"Selected processing model updated to {valid_model}",
+    }
+
+
+class GuardianSettingPayload(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/settings/guardian")
+def get_user_guardian_setting(user: CurrentUser):
+    """Retrieve current user/company Guardian mode setting."""
+    from backend.v1.routes import COMPANY_GUARDIAN_SETTINGS
+
+    guardian_enabled = COMPANY_GUARDIAN_SETTINGS.get(str(user["id"]), True)
+    return {
+        "guardian": guardian_enabled,
+        "guardianFeeCredits": 5,
+        "mode": "guardian_verification" if guardian_enabled else "direct_return",
+        "description": (
+            "Guardian Verification: Grounded evidence citations, schema checks, guardrails (takes 5 credits fee)"
+            if guardian_enabled
+            else "Direct Return: Raw model extraction returned immediately without citation nullification (guardian fee waived)"
+        ),
+    }
+
+
+@app.post("/api/settings/guardian")
+def set_user_guardian_setting(payload: GuardianSettingPayload, user: CurrentUser):
+    """Set preferred Guardian mode (verification with fee vs direct return with fee waived)."""
+    from backend.v1.routes import COMPANY_GUARDIAN_SETTINGS
+
+    COMPANY_GUARDIAN_SETTINGS[str(user["id"])] = bool(payload.enabled)
+    return {
+        "status": "success",
+        "guardian": payload.enabled,
+        "mode": "guardian_verification" if payload.enabled else "direct_return",
+        "message": f"Guardian mode set to {'enabled (Full Verification)' if payload.enabled else 'disabled (Direct Return)'}",
+    }
+
+
+class CalculateCostRequest(BaseModel):
+    service: str
+    model: Optional[str] = None
+    guardian: bool = True
+
+
+@app.post("/api/services/calculate-cost")
+def calculate_service_cost_api(payload: CalculateCostRequest):
+    """Calculate exact credit breakdown for a given service, model, and guardian mode."""
+    from backend.models_config import model_registry
+
+    service_name = payload.service.lower().replace("-", "_")
+    base_credits = SERVICE_PRICING.get(service_name, {}).get("credits", 10)
+    return model_registry.calculate_service_cost(base_credits, payload.model, guardian=payload.guardian)
 
 
 @app.post("/api/playground/run")
 def run_playground(
     payload: PlaygroundRunPayload,
     user: CurrentUser,
+    idempotency_key: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
 ):
-    """
-    Execute an interactive playground run for any Document AI service.
-    Supports comparing models/prompts, custom schemas, raw text / sample docs, or drive documents.
-    """
+    """Use the shared service executor with the playground's response envelope."""
     from backend.agent.playground_presets import SERVICE_PRESETS
+    from backend.services.engine import execute_service
+    from backend.services.idempotency import begin, finish, finish_error, replay_response
 
-    service_name = payload.service.lower().replace("-", "_")
-    if service_name not in SERVICE_PRICING:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown service '{payload.service}'. Supported: {', '.join(SERVICE_PRICING.keys())}",
-        )
-
-    account = billing_service.get_or_create_company(user["id"], user.get("name"))
-    cost = billing_service.get_service_cost(service_name)
-    if account.remaining_credits < cost:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient company credits. Required: {cost}, Remaining: {account.remaining_credits}.",
-        )
-
-    # Resolve document context
-    filename = "playground_sample.txt"
-    doc_id = payload.document_id
-    bundle = None
-
-    if doc_id:
-        doc = query(
-            "SELECT id, original_filename FROM docuchat.documents WHERE id = %s AND user_id = %s",
-            (doc_id, str(user["id"])),
-            one=True,
-        )
-        if not doc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-        filename = doc["original_filename"]
-        bundle = rag.get_bundle(doc_id)
-    elif payload.text_content and payload.text_content.strip():
-        bundle = rag.create_text_bundle(payload.text_content.strip(), name=f"{service_name}_sample.txt")
-        filename = f"{service_name}_sample.txt"
-        doc_id = bundle.doc_id
-    else:
-        preset = SERVICE_PRESETS.get(service_name)
-        if preset and preset.get("sample_text"):
-            sample = preset["sample_text"]
-            bundle = rag.create_text_bundle(sample, name=f"{service_name}_preset_sample.txt")
-            filename = f"{service_name}_preset_sample.txt"
-            doc_id = bundle.doc_id
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Either document_id or text_content must be provided.",
-            )
-
-    if bundle.vector_store is None:
-        raise HTTPException(status_code=500, detail="Document vector store failed to initialize.")
-
-    remaining = billing_service.check_and_deduct_credits(
-        account, service_name, document_id=doc_id, request_summary=f"Playground run: {service_name}"
-    )
-
-    preset = SERVICE_PRESETS.get(service_name, {})
-    effective_system_prompt = payload.system_prompt or preset.get("default_system_prompt")
-
-    schema_instruction = ""
-    if payload.schema_override:
-        schema_dump = (
-            json.dumps(payload.schema_override, indent=2, ensure_ascii=False)
-            if isinstance(payload.schema_override, (dict, list))
-            else str(payload.schema_override)
-        )
-        schema_instruction = (
-            f"\n\nOUTPUT SCHEMA REQUIREMENT:\n"
-            f"You MUST format and return your final response strictly as a JSON object adhering to this schema/structure:\n"
-            f"```json\n{schema_dump}\n```\n"
-            f"Return ONLY valid JSON matching this schema."
-        )
-
-    if effective_system_prompt and schema_instruction:
-        effective_system_prompt = effective_system_prompt + schema_instruction
-
-    task_prompt = (
-        payload.user_prompt
-        or preset.get("default_query")
-        or f"Perform complete {service_name} intelligence analysis on '{filename}'."
-    )
-    if not effective_system_prompt and schema_instruction:
-        task_prompt = task_prompt + schema_instruction
-
-    model = payload.model or settings.DEFAULT_MODEL
-    temp = payload.temperature
-
-    agent = rag._build_agent(
-        bundle=bundle,
-        model_name=model,
-        mode=service_name,
-        system_prompt=effective_system_prompt,
-        temperature=temp,
-    )
-
-    t0 = time.time()
+    service = payload.service.lower().replace("-", "_")
+    preset = SERVICE_PRESETS.get(service, {})
+    content = payload.text_content
+    if not payload.document_id and not (content and content.strip()):
+        content = preset.get("sample_text")
     try:
-        result = agent.run(task_prompt)
-        latency_ms = int((time.time() - t0) * 1000)
-
-        if not result.success:
-            remaining = billing_service.refund_credits(
-                account=account,
-                service_name=service_name,
-                credits_to_refund=cost,
-                document_id=doc_id,
-                reason=result.error or f"Playground {service_name} execution failed",
-            )
-            return {
-                "success": False,
-                "service": service_name,
-                "model": model,
-                "documentId": doc_id,
-                "filename": filename,
-                "latencyMs": latency_ms,
-                "creditsDeducted": 0,
-                "creditsRefunded": cost,
-                "creditsRemaining": remaining,
-                "error": result.error,
-                "result": result.response or "",
-                "data": None,
-                "iterations": result.iterations,
-                "steps": result.steps,
-            }
-
-        raw_text = getattr(result, "response", "") or ""
-        parsed_json = _extract_json_from_text(raw_text)
-
-        if parsed_json is None and hasattr(result, "steps") and result.steps:
-            for step in reversed(result.steps):
-                obs = step.get("observation", "")
-                if isinstance(obs, str) and ("{" in obs or "[" in obs):
-                    step_json = _extract_json_from_text(obs)
-                    if step_json:
-                        parsed_json = step_json
-                        break
-
-        is_structured_svc = service_name in [
-            "invoice", "receipt", "contract", "compliance", "form_parser",
-            "resume", "redaction", "classifier", "financial_statement", "translation", "anomaly_audit"
-        ]
-        if (payload.output_format == "json" or payload.schema_override or is_structured_svc) and parsed_json is None:
-            parsed_json = extract_structured_data(raw_text, service=service_name)
-
-        formatted_result = (
-            json.dumps(parsed_json, indent=2, ensure_ascii=False)
-            if isinstance(parsed_json, (dict, list))
-            else raw_text
+        request = ServiceRequest(
+            service=service,
+            document_id=payload.document_id,
+            text_content=content,
+            query=payload.user_prompt or preset.get("default_query"),
+            system_prompt=payload.system_prompt,
+            schema_override=payload.schema_override,
+            model=payload.model,
+            temperature=payload.temperature,
+            output_format=payload.output_format,
+            guardian=payload.guardian,
+            options=payload.options,
         )
-
-        return {
-            "success": True,
-            "service": service_name,
-            "model": model,
-            "temperature": temp,
-            "documentId": doc_id,
-            "filename": filename,
-            "latencyMs": latency_ms,
-            "creditsDeducted": cost,
-            "creditsRemaining": remaining,
-            "result": formatted_result,
-            "data": parsed_json,
-            "raw": raw_text,
-            "iterations": result.iterations,
-            "steps": result.steps,
-            "schemaUsed": payload.schema_override,
-            "promptUsed": task_prompt,
-        }
-
-    except Exception as exc:
-        latency_ms = int((time.time() - t0) * 1000)
-        logging.exception("Playground run failed for %s: %s", service_name, exc)
-        remaining = billing_service.refund_credits(
-            account=account,
-            service_name=service_name,
-            credits_to_refund=cost,
-            document_id=doc_id,
-            reason=f"Playground exception: {exc}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Playground execution failed: {exc}. Credits refunded (Remaining: {remaining}).",
-        )
-
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    account = billing_service.get_or_create_company(user["id"], user.get("name"))
+    operation_key, replay = begin(account, "playground", idempotency_key, request.model_dump(mode="json"))
+    if replay:
+        return replay_response(replay)
+    try:
+        body = execute_service(request, account)
+    except HTTPException as exc:
+        finish_error(account, operation_key, exc)
+        raise
+    data = body.get("data")
+    body.update(
+        result=json.dumps(jsonable_encoder(data), indent=2, ensure_ascii=False)
+        if data is not None
+        else body.get("raw", ""),
+        filename="document" if payload.document_id else f"{service}_sample.txt",
+        temperature=payload.temperature,
+        schemaUsed=payload.schema_override,
+    )
+    finish(account, operation_key, body)
+    return body

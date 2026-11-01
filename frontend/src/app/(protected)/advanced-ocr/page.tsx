@@ -1,8 +1,9 @@
 "use client";
 import { useLanguage } from "@/components/providers/language-provider";
+import { useModelSettings } from "@/components/providers/model-provider";
 import { getUploadSizeError, UPLOAD_LIMIT_LABEL } from "@/lib/upload-limits";
 
-import { useState, useRef, useId } from "react";
+import { useState, useRef, useId, useEffect } from "react";
 import {
   ScanText,
   UploadCloud,
@@ -77,8 +78,17 @@ function getBlockBadgeStyle(type: string) {
 
 export default function AdvancedOcrPage() {
   const { t } = useLanguage();
+  const { selectedModel, availableModels } = useModelSettings();
   const fileInputId = useId();
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [ocrModel, setOcrModel] = useState<string>(selectedModel || "gpt-4o-mini");
+
+  useEffect(() => {
+    if (selectedModel) {
+      setOcrModel(selectedModel);
+    }
+  }, [selectedModel]);
 
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -171,8 +181,12 @@ export default function AdvancedOcrPage() {
         start_page: startPage,
         end_page: typeof endPage === "number" ? endPage : undefined,
         language,
+        model: ocrModel,
       });
       setResult(data);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("doctool:credit-updated"));
+      }
     } catch (err) {
       setError(
         err instanceof Error
@@ -447,7 +461,23 @@ export default function AdvancedOcrPage() {
         </div>
 
         {/* Extraction Settings */}
-        <div className="grid gap-5 sm:grid-cols-3">
+        <div className="grid gap-5 sm:grid-cols-4">
+          <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
+            {t("AI Model")}
+            <select
+              disabled={busy}
+              value={ocrModel}
+              onChange={(e) => setOcrModel(e.target.value)}
+              className={fieldClass}
+            >
+              {availableModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name} ({m.credit_cost} cr)
+                </option>
+              ))}
+            </select>
+          </label>
+
           <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
             {t("Start page")}
             <input
@@ -561,6 +591,11 @@ export default function AdvancedOcrPage() {
                 <span className="rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-semibold text-teal-800">
                   {t("Ready")}
                 </span>
+                {(result.model || ocrModel) && (
+                  <span className="rounded-md border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 text-xs font-mono font-medium text-slate-700 dark:text-slate-300">
+                    Model: {result.model || ocrModel}
+                  </span>
+                )}
               </div>
               <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 sm:text-sm">
                 {result.processed_pages}{" "}

@@ -653,25 +653,25 @@ the service card. The chat interface loads with the corresponding mode pre-selec
 
 ## Company API Usage & Credit Billing
 
-Every company account receives **1,200 free trial credits** upon creation (free trial tier available only, zero credit card required).
+Every company account receives **300 free trial credits** upon creation (free trial tier available only, zero credit card required).
 Each Document AI service is priced dynamically according to the underlying LLM token, vision, and reasoning compute intensity.
 
 ### Service Credit Pricing
 
 | Document AI Service | API Route | LLM Compute Tier | Cost (Credits) | Free Trial Capacity |
 |---|---|---|---|---|
-| **Document Chat** | `/api/v1/services/chat` | Light | 5 credits | ~240 calls |
-| **Executive Summary** | `/api/v1/services/summary` | Light-Moderate | 10 credits | ~120 calls |
-| **Data Extraction** | `/api/v1/services/extraction` | Moderate | 15 credits | ~80 calls |
-| **Intelligent Form Parser** | `/api/v1/services/form_parser` | Moderate | 20 credits | ~60 calls |
-| **Receipt & Expenses** | `/api/v1/services/receipt` | Moderate | 20 credits | ~60 calls |
-| **Invoice Processing** | `/api/v1/services/invoice` | Moderate-Heavy | 25 credits | ~48 calls |
-| **Resume & Talent** | `/api/v1/services/resume` | Moderate-Heavy | 25 credits | ~48 calls |
-| **PII & Compliance Audit** | `/api/v1/services/compliance` | Heavy | 30 credits | ~40 calls |
-| **Contract Analysis** | `/api/v1/services/contract` | Heavy | 35 credits | ~34 calls |
-| **Google AI Multimodal** | `/api/v1/services/google_ai` | Multimodal Heavy | 40 credits | ~30 calls |
-| **Auto-Routing Coordinator** | `/api/v1/services/coordinator` | Multi-Agent | 45 credits | ~26 calls |
-| **Deep Research** | `/api/v1/services/research` | Multi-Step ReAct | 50 credits | ~24 calls |
+| **Document Chat** | `/api/v1/services/chat` | Light | 5 credits | ~60 calls |
+| **Executive Summary** | `/api/v1/services/summary` | Light-Moderate | 10 credits | ~30 calls |
+| **Data Extraction** | `/api/v1/services/extraction` | Moderate | 15 credits | ~20 calls |
+| **Intelligent Form Parser** | `/api/v1/services/form_parser` | Moderate | 20 credits | ~15 calls |
+| **Receipt & Expenses** | `/api/v1/services/receipt` | Moderate | 20 credits | ~15 calls |
+| **Invoice Processing** | `/api/v1/services/invoice` | Moderate-Heavy | 25 credits | ~12 calls |
+| **Resume & Talent** | `/api/v1/services/resume` | Moderate-Heavy | 25 credits | ~12 calls |
+| **PII & Compliance Audit** | `/api/v1/services/compliance` | Heavy | 30 credits | ~10 calls |
+| **Contract Analysis** | `/api/v1/services/contract` | Heavy | 35 credits | ~8 calls |
+| **Google AI Multimodal** | `/api/v1/services/google_ai` | Multimodal Heavy | 40 credits | ~7 calls |
+| **Auto-Routing Coordinator** | `/api/v1/services/coordinator` | Multi-Agent | 45 credits | ~6 calls |
+| **Deep Research** | `/api/v1/services/research` | Multi-Step ReAct | 50 credits | ~6 calls |
 
 ### Authenticating Company API Calls
 
@@ -869,7 +869,7 @@ DocuChat provides an enterprise-ready B2B platform with dedicated developer APIs
 │  • B2B REST Pipeline API v1                [/api/v1/pipeline/run]      │
 │  • ChatGPT Custom GPT Actions Schema       [/api/v1/gpt/openapi.json]  │
 │  • OpenAI Function Calling Catalog         [/api/v1/openai/tools]      │
-│  • Atomic Credit Billing & Usage Logs      [1,200 Trial Credits]       │
+│  • Atomic Credit Billing & Usage Logs      [300 Trial Credits]         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1004,7 +1004,7 @@ matches = client.search(doc_id, query="Payment terms and late fees", top_k=3)
 | `GET` | `/api/v1/storage/documents/{id}/presigned-url` | Generate an expiring signed document download URL. |
 | `GET` | `/api/v1/gpt/openapi.json` | ChatGPT Custom GPT Actions OpenAPI 3.1 specification. |
 | `GET` | `/api/v1/openai/tools` | OpenAI function calling schema array. |
-| `GET` | `/api/v1/company/account` | Current trial credits (1,200 initial) and plan tier. |
+| `GET` | `/api/v1/company/account` | Current trial credits (300 initial) and plan tier. |
 | `GET` | `/api/v1/company/pricing` | Credit consumption rates per LLM tier. |
 
 ---

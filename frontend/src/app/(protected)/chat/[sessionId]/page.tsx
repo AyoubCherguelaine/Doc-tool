@@ -1,5 +1,6 @@
 "use client";
 import { useLanguage } from "@/components/providers/language-provider";
+import { useModelSettings } from "@/components/providers/model-provider";
 import { use, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -96,8 +97,9 @@ export default function ChatPage({
   const [mode, setMode] = useState<ChatMode>(
     initialWorkflow?.mode || "conversational",
   );
+  const { availableModels, selectedModel } = useModelSettings();
   const [models, setModels] = useState<string[]>([]);
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState(selectedModel || "");
   const [style, setStyle] = useState("balanced");
   const [sourceOpen, setSourceOpen] = useState(true);
   const [page, setPage] = useState(1);
@@ -136,7 +138,7 @@ export default function ChatPage({
       .then((c) => {
         if (active) {
           setModels(c.models);
-          setModel(c.defaultModel);
+          setModel((prev) => prev || selectedModel || c.defaultModel);
         }
       })
       .catch(() => {});
@@ -144,7 +146,13 @@ export default function ChatPage({
       active = false;
       abort.current?.abort();
     };
-  }, [sessionId]);
+  }, [sessionId, selectedModel]);
+
+  useEffect(() => {
+    if (selectedModel) {
+      setModel(selectedModel);
+    }
+  }, [selectedModel]);
   useEffect(() => {
     if (!session || !sourceOpen) return;
     let active = true;
@@ -218,6 +226,9 @@ export default function ChatPage({
     } finally {
       setStreaming(false);
       abort.current = null;
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("doctool:credit-updated"));
+      }
     }
   };
   const exportChat = () => {
@@ -538,16 +549,22 @@ export default function ChatPage({
                     {t("Model")}</label>
                   <select
                     id="model"
-                    disabled={streaming || !models.length}
+                    disabled={streaming || (!models.length && !availableModels.length)}
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
-                    className="w-full rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs"
+                    className="w-full rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-mono"
                   >
-                    {models.length ? (
-                      models.map((m) => <option key={m}>{m}</option>)
-                    ) : (
-                      <option value="">{t("Server default")}</option>
-                    )}
+                    {(models.length ? models : availableModels.map((m) => m.id)).map((m) => {
+                      const mInfo = availableModels.find((item) => item.id === m);
+                      const label = mInfo
+                        ? `${mInfo.name} (${mInfo.credit_cost} credits)`
+                        : m;
+                      return (
+                        <option key={m} value={m}>
+                          {label}
+                        </option>
+                      );
+                    })}
                   </select>
                 </div>
                 <div>

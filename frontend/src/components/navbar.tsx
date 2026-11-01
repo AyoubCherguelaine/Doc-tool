@@ -21,6 +21,7 @@ import {
   ScanText,
   Bot,
   BookOpen,
+  Settings as SettingsIcon,
 } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { Brand } from "@/components/brand";
@@ -29,6 +30,9 @@ import { fetchCompanyAccount, type CompanyAccountInfo } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { LanguageToggle } from "@/components/ui/language-toggle";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { ModelSelectorButton, ModelSelectionModal } from "@/components/ui/model-selector";
+import { SettingsModal } from "@/components/ui/settings-modal";
+import { useModelSettings } from "@/components/providers/model-provider";
 
 function getPageTitle(pathname: string, t: (value: string) => string): string {
   if (pathname.startsWith("/overview")) return t("Platform Overview");
@@ -39,12 +43,14 @@ function getPageTitle(pathname: string, t: (value: string) => string): string {
   if (pathname.startsWith("/usage")) return t("Credits & Usage Logs");
   if (pathname.startsWith("/conversations")) return t("Chats");
   if (pathname.startsWith("/chat")) return t("Document Chat");
+  if (pathname.startsWith("/settings")) return t("Settings & Workspace");
   return t("Document AI");
 }
 
 export function Navbar() {
   const { t } = useLanguage();
   const { user, logout } = useSession();
+  const { selectedModelInfo, openModelModal, openSettings } = useModelSettings();
   const pathname = usePathname();
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -57,13 +63,24 @@ export function Navbar() {
 
   useEffect(() => {
     let active = true;
-    fetchCompanyAccount()
-      .then((data) => {
-        if (active) setAccount(data);
-      })
-      .catch(() => {});
+    const updateAccount = () => {
+      fetchCompanyAccount()
+        .then((data) => {
+          if (active) setAccount(data);
+        })
+        .catch(() => {});
+    };
+
+    updateAccount();
+
+    const handleCreditUpdate = () => updateAccount();
+    window.addEventListener("doctool:credit-updated", handleCreditUpdate);
+    window.addEventListener("focus", handleCreditUpdate);
+
     return () => {
       active = false;
+      window.removeEventListener("doctool:credit-updated", handleCreditUpdate);
+      window.removeEventListener("focus", handleCreditUpdate);
     };
   }, [pathname]);
 
@@ -107,6 +124,12 @@ export function Navbar() {
       icon: Bot,
       isActive: (p: string) => p.startsWith("/services"),
     },
+    {
+      href: "/settings",
+      label: t("Settings"),
+      icon: SettingsIcon,
+      isActive: (p: string) => p.startsWith("/settings"),
+    },
   ];
 
   const copyApiKey = async () => {
@@ -120,8 +143,11 @@ export function Navbar() {
     } catch {}
   };
 
-  const remaining = account?.remainingCredits ?? 1200;
-  const initial = user?.name?.[0]?.toUpperCase() || "U";
+  const remaining = account?.remainingCredits ?? 300;
+  const cleanName = (user?.name || "").trim().startsWith("http") || (user?.name || "").includes("@") || !(user?.name || "").trim()
+    ? "Ayoub"
+    : user!.name!.trim();
+  const initial = cleanName[0]?.toUpperCase() || "A";
   const pageTitle = getPageTitle(pathname, t);
 
   return (
@@ -159,7 +185,20 @@ export function Navbar() {
         </div>
 
         {/* Right: Theme Toggle + Small Credit Pill + Profile */}
-        <div className="flex items-center gap-2.5 sm:gap-3">
+        <div className="flex items-center gap-2 sm:gap-2.5">
+          {/* OpenAI-style Model Selector Button */}
+          <ModelSelectorButton size="sm" />
+
+          {/* DEDICATED SETTINGS BUTTON */}
+          <button
+            onClick={openSettings}
+            title={t("Settings: AI Model, Guardian & Workspace", "الإعدادات ومساحة العمل")}
+            className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition shadow-2xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 cursor-pointer"
+          >
+            <SettingsIcon size={14} className="text-emerald-600 dark:text-emerald-400" />
+            <span className="hidden sm:inline">{t("Settings")}</span>
+          </button>
+
           {/* THEME TOGGLE (WHITE/GREEN <-> MODERN DARK) */}
           <LanguageToggle />
           <ThemeToggle />
@@ -210,7 +249,7 @@ export function Navbar() {
                     </span>
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-bold text-slate-900 dark:text-slate-100">
-                        {user?.name}
+                        {cleanName}
                       </p>
                       <p className="truncate text-xs text-slate-500 dark:text-slate-400">
                         {user?.email}
@@ -219,61 +258,46 @@ export function Navbar() {
                   </div>
                 </div>
 
-                {/* Workspace / Select Group */}
+                {/* Dedicated Workspace Card for this user */}
                 <div className="border-b border-slate-100 p-3 dark:border-slate-800">
-                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 mb-2 px-1">
-                    {t("Select Group / Workspace")}
-                  </p>
-                  <div className="space-y-1">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedGroup("main")}
-                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-xs font-medium transition ${
-                        selectedGroup === "main"
-                          ? "bg-emerald-50 text-emerald-950 font-semibold dark:bg-emerald-950/40 dark:text-emerald-300"
-                          : "text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800/60"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 truncate">
-                        <Building
-                          size={14}
-                          className="text-emerald-600 dark:text-emerald-400"
-                        />
-                        <span className="truncate">
-                          {account?.companyName || t("Default Organization")}
-                        </span>
-                      </div>
-                      {selectedGroup === "main" && (
-                        <Check
-                          size={14}
-                          className="text-emerald-600 dark:text-emerald-400"
-                        />
-                      )}
-                    </button>
+                  <div className="flex items-center justify-between mb-2 px-1">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                      {t("Dedicated Workspace", "مساحة العمل")}
+                    </p>
+                    <span className="inline-flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 font-bold">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      {t("Isolated Instance", "مثيل معزول")}
+                    </span>
+                  </div>
 
-                    <button
-                      type="button"
-                      onClick={() => setSelectedGroup("personal")}
-                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-xs font-medium transition ${
-                        selectedGroup === "personal"
-                          ? "bg-emerald-50 text-emerald-950 font-semibold dark:bg-emerald-950/40 dark:text-emerald-300"
-                          : "text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800/60"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 truncate">
-                        <Users
-                          size={14}
-                          className="text-slate-500 dark:text-slate-400"
-                        />
-                        <span>{t("Personal Workspace")}</span>
-                      </div>
-                      {selectedGroup === "personal" && (
-                        <Check
-                          size={14}
-                          className="text-emerald-600 dark:text-emerald-400"
-                        />
-                      )}
-                    </button>
+                  <div className="rounded-xl border border-emerald-200/60 bg-emerald-50/40 p-2.5 dark:border-emerald-800/40 dark:bg-emerald-950/20">
+                    <div className="flex items-center gap-2">
+                      <Building
+                        size={15}
+                        className="text-emerald-600 dark:text-emerald-400 shrink-0"
+                      />
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate">
+                        {account?.companyName && !account.companyName.startsWith("http") && !account.companyName.includes("daall")
+                          ? account.companyName
+                          : `${cleanName}'s Workspace`}
+                      </span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between pt-2 border-t border-emerald-100 dark:border-emerald-900/40 text-[11px]">
+                      <span className="text-slate-500 dark:text-slate-400 font-mono text-[10px]">
+                        {account?.planTier ? `${account.planTier}` : "Free Trial"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setProfileDropdownOpen(false);
+                          openSettings();
+                        }}
+                        className="font-semibold text-emerald-700 dark:text-emerald-400 hover:underline inline-flex items-center gap-1 text-[11px]"
+                      >
+                        <SettingsIcon size={11} />
+                        <span>{t("Settings", "الإعدادات")}</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -338,12 +362,39 @@ export function Navbar() {
                   <div className="rounded bg-slate-900 dark:bg-slate-950 p-1.5 font-mono text-[11px] text-emerald-400 truncate border border-slate-800">
                     {account?.apiKeyPrefix || "docu_live_"}••••••••••••••••
                   </div>
-                  <p className="text-[10px] text-slate-400 dark:text-slate-500">
-                    {t("Configured model:")}{" "}
-                    <span className="font-semibold text-slate-600 dark:text-slate-300 font-mono">
-                      Luna (gpt-6-luna)
+                  <div className="flex items-center justify-between text-[10px] text-slate-400 dark:text-slate-500 pt-1">
+                    <span>
+                      {t("Model:")}{" "}
+                      <span className="font-semibold text-slate-700 dark:text-slate-200 font-mono">
+                        {selectedModelInfo?.name || "gpt-4o-mini"}
+                      </span>
                     </span>
-                  </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProfileDropdownOpen(false);
+                        openModelModal();
+                      }}
+                      className="text-emerald-600 dark:text-emerald-400 hover:underline font-semibold"
+                    >
+                      {t("Change")}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Settings & Preferences Link */}
+                <div className="border-b border-slate-100 p-2 dark:border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProfileDropdownOpen(false);
+                      openSettings();
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800/60 transition cursor-pointer"
+                  >
+                    <SettingsIcon size={14} className="text-emerald-600 dark:text-emerald-400" />
+                    <span>{t("Settings & Workspace", "الإعدادات ومساحة العمل")}</span>
+                  </button>
                 </div>
 
                 {/* Logout Button */}
@@ -502,6 +553,10 @@ export function Navbar() {
           </p>
         </div>
       </aside>
+
+      {/* Global Modals for Navbar & Entire App */}
+      <ModelSelectionModal />
+      <SettingsModal />
     </>
   );
 }
